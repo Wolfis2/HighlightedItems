@@ -713,105 +713,126 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         if (!await MoveItemsCommonPreamble()) return false;
         _prevMousePos = Mouse.GetCursorPosition();
 
-        // A 12×5 inventory has 60 cells. In the worst case each iteration moves exactly one
-        // item one cell closer to its target, so 60 iterations is a safe upper bound that
-        // guarantees termination while covering any realistic starting arrangement.
-        const int MaxIterations = 60;
-        for (var iteration = 0; iteration < MaxIterations; iteration++)
+        // Hard upper bound: 120 moves covers any realistic 12×5 inventory (60 items × 2 moves
+        // in the absolute worst case where every item must be parked before reaching its target).
+        const int MaxMoves = 120;
+        var moveCount = 0;
+
+        while (moveCount < MaxMoves)
         {
             if (MoveCancellationRequested) { await StopMovingItems(); return false; }
             if (!InGameState.IngameUi.InventoryPanel.IsVisible) break;
 
-            // Re-read inventory state fresh every iteration so we always have the true layout.
+            // Re-read current layout every iteration for an accurate view of the grid.
             var currentItems = GameController.IngameState.ServerData.PlayerInventories[0].Inventory.InventorySlotItems
                 .Where(x => !IsInIgnoreCell(x))
                 .ToList();
 
             if (!currentItems.Any()) break;
 
-            // --- Planning phase: compute the ideal target layout ---
-            // Sort: primary by item category (groups maps/currency/rings/etc. together),
-            //       then largest items first within each group (FFD packs most efficiently).
+            // Derive the pixel grid geometry from the items' own on-screen rects.
+            // Averaging across all items eliminates any panel-padding error that would arise
+            // from naively dividing the outer panel rect by 12×5.
+            var (cellW, cellH, gridOriginX, gridOriginY) = CalibrateGridGeometry(currentItems, inventoryRect);
+
+            // Build the desired layout using category-grouped First-Fit Decreasing.
+            // The sort key is fully deterministic (category -> area desc -> width desc -> path ->
+            // current position), so every item is assigned the same target slot on every
+            // iteration, giving a stable, predictable end-state.
             var packingOrder = currentItems
-                .OrderBy(x => GetItemCategory(x))
+                .OrderBy(GetItemCategory)
                 .ThenByDescending(x => x.SizeX * x.SizeY)
                 .ThenByDescending(x => x.SizeX)
                 .ThenBy(x => x.Item?.Path ?? "")
+                .ThenBy(x => x.PosX)
+                .ThenBy(x => x.PosY)
                 .ToList();
 
             var targetGrid = BuildIgnoredCellsGrid();
-            // targetMap key = item's CURRENT (PosX, PosY); value = computed target (col, row)
-            var targetMap = new Dictionary<(int, int), (int col, int row)>();
-            foreach (var item in packingOrder)
+            var targetCols = new int[packingOrder.Count];
+            var targetRows = new int[packingOrder.Count];
+            for (var i = 0; i < packingOrder.Count; i++)
             {
-                var fit = FindFirstFit(targetGrid, item.SizeX, item.SizeY);
-                if (fit == null) continue;
-                var (tc, tr) = fit.Value;
-                for (var dy = 0; dy < item.SizeY; dy++)
-                    for (var dx = 0; dx < item.SizeX; dx++)
-                        targetGrid[tc + dx, tr + dy] = true;
-                targetMap[(item.PosX, item.PosY)] = (tc, tr);
+                var it = packingOrder[i];
+                var fit = FindFirstFit(targetGrid, it.SizeX, it.SizeY);
+                if (fit == null) { targetCols[i] = -1; targetRows[i] = -1; continue; }
+                targetCols[i] = fit.Value.col;
+                targetRows[i] = fit.Value.row;
+                for (var dy = 0; dy < it.SizeY; dy++)
+                    for (var dx = 0; dx < it.SizeX; dx++)
+                        targetGrid[targetCols[i] + dx, targetRows[i] + dy] = true;
             }
 
-            // --- Execution phase: move one item per iteration to an empty target ---
-            // Build current occupancy for collision checks.
+            // Convergence check: if every item is already at its target, we are done.
+            var done = true;
+            for (var i = 0; i < packingOrder.Count; i++)
+            {
+                if (targetCols[i] < 0) continue;
+                if (packingOrder[i].PosX != targetCols[i] || packingOrder[i].PosY != targetRows[i])
+                { done = false; break; }
+            }
+            if (done) break;
+
+            // Find a "safe" move: an item whose entire target area is currently free.
             var occupancy = BuildOccupancyGrid(currentItems);
-
-            // Try to find a "safe" move: item whose entire target area is currently free.
-            ServerInventory.InventSlotItem itemToMove = null;
-            int destCol = 0, destRow = 0;
-
-            foreach (var item in packingOrder)
+            var moveIdx = -1;
+            var destCol = 0; var destRow = 0;
+            for (var i = 0; i < packingOrder.Count && moveIdx < 0; i++)
             {
-                if (!targetMap.TryGetValue((item.PosX, item.PosY), out var target)) continue;
-                var (tc, tr) = target;
-                if (item.PosX == tc && item.PosY == tr) continue; // already in place
-
-                if (IsTargetAreaFree(occupancy, tc, tr, item.SizeX, item.SizeY, item.PosX, item.PosY, item.SizeX, item.SizeY))
-                {
-                    itemToMove = item;
-                    destCol = tc;
-                    destRow = tr;
-                    break;
-                }
+                if (targetCols[i] < 0) continue;
+                var it = packingOrder[i];
+                var tc = targetCols[i]; var tr = targetRows[i];
+                if (it.PosX == tc && it.PosY == tr) continue;
+                if (IsTargetAreaFree(occupancy, tc, tr, it.SizeX, it.SizeY, it.PosX, it.PosY, it.SizeX, it.SizeY))
+                { moveIdx = i; destCol = tc; destRow = tr; }
             }
 
-            if (itemToMove == null)
+            // Deadlock: every pending item's target is blocked by another item.
+            // Break the cycle by parking one item in any free area that is NOT its own current cell.
+            if (moveIdx < 0)
             {
-                // All moves are blocked (cycle). Break the deadlock by parking one item in
-                // any free region, which will free up space for other items next iteration.
-                var parkTarget = FindFirstFit(occupancy, 1, 1);
-                if (parkTarget == null) break; // Inventory truly full - nothing to do
-
-                // Pick the first item that still needs to move and can fit in a free region.
-                foreach (var candidate in packingOrder)
+                for (var i = 0; i < packingOrder.Count && moveIdx < 0; i++)
                 {
-                    if (!targetMap.TryGetValue((candidate.PosX, candidate.PosY), out var t)) continue;
-                    if (candidate.PosX == t.col && candidate.PosY == t.row) continue;
+                    if (targetCols[i] < 0) continue;
+                    var it = packingOrder[i];
+                    if (it.PosX == targetCols[i] && it.PosY == targetRows[i]) continue;
 
-                    // Temporarily unmark the candidate's own cells so FindFirstFit can find
-                    // a truly empty region elsewhere (not the item's own current position).
                     var tempGrid = BuildOccupancyGrid(currentItems);
-                    for (var dy = 0; dy < candidate.SizeY; dy++)
-                        for (var dx = 0; dx < candidate.SizeX; dx++)
-                            tempGrid[candidate.PosX + dx, candidate.PosY + dy] = false;
+                    for (var dy = 0; dy < it.SizeY; dy++)
+                        for (var dx = 0; dx < it.SizeX; dx++)
+                            tempGrid[it.PosX + dx, it.PosY + dy] = false;
 
-                    var parkFit = FindFirstFit(tempGrid, candidate.SizeX, candidate.SizeY);
-                    if (parkFit == null) continue;
+                    var parkSlot = FindFirstFitNotAt(tempGrid, it.SizeX, it.SizeY, it.PosX, it.PosY);
+                    if (parkSlot == null) continue;
 
-                    itemToMove = candidate;
-                    destCol = parkFit.Value.col;
-                    destRow = parkFit.Value.row;
-                    break;
+                    moveIdx = i;
+                    destCol = parkSlot.Value.col;
+                    destRow = parkSlot.Value.row;
                 }
-
-                if (itemToMove == null) break; // Can't break the deadlock
             }
 
-            // Execute the single move: pick up then place.
-            var srcCenter = GetInventorySlotCenter(inventoryRect, itemToMove.PosX, itemToMove.PosY);
-            var dstCenter = GetInventorySlotCenter(inventoryRect, destCol, destRow);
+            if (moveIdx < 0) break;
 
+            var itemToMove = packingOrder[moveIdx];
+
+            // Source: click the centre of the item's own top-left cell.
+            // Using GetClientRect() directly gives the exact on-screen position; we compute
+            // the per-cell size from the item's own rect to guarantee accuracy regardless of
+            // item dimensions. This avoids coordinate drift that accumulates when deriving
+            // cell size from the outer panel rect (which may include padding/borders).
+            var itemRect = itemToMove.GetClientRect();
+            var srcCellW = itemToMove.SizeX > 0 ? itemRect.Width / itemToMove.SizeX : cellW;
+            var srcCellH = itemToMove.SizeY > 0 ? itemRect.Height / itemToMove.SizeY : cellH;
+            var srcCenter = new SharpDX.Vector2(
+                itemRect.X + srcCellW * 0.5f,
+                itemRect.Y + srcCellH * 0.5f);
+
+            // Destination: centre of the top-left target cell in the calibrated grid.
+            var dstCenter = new SharpDX.Vector2(
+                gridOriginX + (destCol + 0.5f) * cellW,
+                gridOriginY + (destRow + 0.5f) * cellH);
+
+            // Pick up (left-click on source; no modifier = plain grab).
             Mouse.moveMouse(srcCenter + WindowOffset);
             await Wait(MouseMoveDelay, true);
             Mouse.LeftDown();
@@ -819,16 +840,51 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             Mouse.LeftUp();
             await Wait(KeyDelay, true);
 
+            // Place (left-click on destination; item's top-left aligns with clicked cell).
             Mouse.moveMouse(dstCenter + WindowOffset);
             await Wait(MouseMoveDelay, true);
             Mouse.LeftDown();
             await Wait(MouseDownDelay, true);
             Mouse.LeftUp();
             await Wait(KeyDelay, true);
+
+            moveCount++;
         }
 
         await StopMovingItems();
         return true;
+    }
+
+    /// <summary>
+    /// Derives the inventory grid's per-cell dimensions and top-left origin by averaging
+    /// the values implied by every item's actual on-screen rect and known grid position.
+    /// This is more accurate than dividing the outer panel rect by 12×5, because the
+    /// panel typically includes padding/borders outside the playable cell area.
+    /// Falls back to the panel rect when no valid item rects are available.
+    /// </summary>
+    private static (float cellW, float cellH, float originX, float originY) CalibrateGridGeometry(
+        List<ServerInventory.InventSlotItem> items, SharpDX.RectangleF fallbackPanelRect)
+    {
+        double sumW = 0, sumH = 0, sumOX = 0, sumOY = 0;
+        var n = 0;
+        foreach (var item in items)
+        {
+            var r = item.GetClientRect();
+            if (r.Width <= 0 || r.Height <= 0 || item.SizeX <= 0 || item.SizeY <= 0) continue;
+            var w = r.Width / item.SizeX;
+            var h = r.Height / item.SizeY;
+            sumW += w;
+            sumH += h;
+            sumOX += r.X - item.PosX * w;
+            sumOY += r.Y - item.PosY * h;
+            n++;
+        }
+        if (n > 0)
+            return ((float)(sumW / n), (float)(sumH / n), (float)(sumOX / n), (float)(sumOY / n));
+
+        // Fallback: derive from the panel rect (less accurate but better than nothing).
+        return (fallbackPanelRect.Width / 12f, fallbackPanelRect.Height / 5f,
+                fallbackPanelRect.X, fallbackPanelRect.Y);
     }
 
     /// <summary>
@@ -846,7 +902,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
 
     /// <summary>
     /// Builds a bool[12,5] occupancy grid where true = cell is occupied by an inventory item.
-    /// grid[col, row] — col is x (0–11), row is y (0–4).
+    /// grid[col, row] -- col is x (0-11), row is y (0-4).
     /// </summary>
     private static bool[,] BuildOccupancyGrid(IEnumerable<ServerInventory.InventSlotItem> items)
     {
@@ -898,7 +954,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 var r = targetRow + dy;
                 if (!occupancy[c, r]) continue;
 
-                // Cell is occupied – is it within the source item's own footprint?
+                // Cell is occupied - is it within the source item's own footprint?
                 if (c >= srcCol && c < srcCol + srcSizeX && r >= srcRow && r < srcRow + srcSizeY)
                     continue; // will be vacated when the item moves, so it's fine
 
@@ -924,13 +980,25 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         return null;
     }
 
-    private static SharpDX.Vector2 GetInventorySlotCenter(SharpDX.RectangleF inventoryRect, int col, int row)
+    /// <summary>
+    /// Like <see cref="FindFirstFit"/> but rejects the slot at (excludeCol, excludeRow) so
+    /// that an item is never "parked" back at its own current position (a no-op move).
+    /// </summary>
+    private static (int col, int row)? FindFirstFitNotAt(
+        bool[,] grid, int width, int height, int excludeCol, int excludeRow)
     {
-        var cellW = inventoryRect.Width / 12f;
-        var cellH = inventoryRect.Height / 5f;
-        return new SharpDX.Vector2(
-            inventoryRect.X + (col + 0.5f) * cellW,
-            inventoryRect.Y + (row + 0.5f) * cellH
-        );
+        for (var row = 0; row <= 5 - height; row++)
+        {
+            for (var col = 0; col <= 12 - width; col++)
+            {
+                if (col == excludeCol && row == excludeRow) continue;
+                var fits = true;
+                for (var dr = 0; dr < height && fits; dr++)
+                    for (var dc = 0; dc < width && fits; dc++)
+                        if (grid[col + dc, row + dr]) fits = false;
+                if (fits) return (col, row);
+            }
+        }
+        return null;
     }
 }

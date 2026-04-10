@@ -972,9 +972,9 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                     // invisible to BuildOccupancyGrid; without this step the park algorithm
                     // would treat those cells as free and park items into them, where the
                     // convergence check cannot see them.
-                    for (var r = 0; r < 5; r++)
-                        for (var c = 0; c < 12; c++)
-                            if (Settings.IgnoredCells[r, c]) tempGrid[c, r] = true;
+                    for (var row = 0; row < 5; row++)
+                        for (var col = 0; col < 12; col++)
+                            if (Settings.IgnoredCells[row, col]) tempGrid[col, row] = true;
 
                     for (var dy = 0; dy < it.SizeY; dy++)
                         for (var dx = 0; dx < it.SizeX; dx++)

@@ -713,84 +713,198 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         if (!await MoveItemsCommonPreamble()) return false;
         _prevMousePos = Mouse.GetCursorPosition();
 
-        // Up to 4 passes: in the worst case (all items need to move) the First-Fit Decreasing
-        // algorithm may need to swap items through intermediate positions. 4 passes is sufficient
-        // to converge for any realistic 12×5 inventory layout.
-        const int MaxPasses = 4;
-        for (var pass = 0; pass < MaxPasses; pass++)
+        // A 12×5 inventory has 60 cells. In the worst case each iteration moves exactly one
+        // item one cell closer to its target, so 60 iterations is a safe upper bound that
+        // guarantees termination while covering any realistic starting arrangement.
+        const int MaxIterations = 60;
+        for (var iteration = 0; iteration < MaxIterations; iteration++)
         {
             if (MoveCancellationRequested) { await StopMovingItems(); return false; }
             if (!InGameState.IngameUi.InventoryPanel.IsVisible) break;
 
+            // Re-read inventory state fresh every iteration so we always have the true layout.
             var currentItems = GameController.IngameState.ServerData.PlayerInventories[0].Inventory.InventorySlotItems
                 .Where(x => !IsInIgnoreCell(x))
                 .ToList();
 
             if (!currentItems.Any()) break;
 
-            // Compute optimal target positions via First-Fit Decreasing bin packing
-            var grid = new bool[12, 5];
-            // Mark ignored cells as occupied
-            for (var r = 0; r < 5; r++)
-                for (var c = 0; c < 12; c++)
-                    if (Settings.IgnoredCells[r, c]) grid[c, r] = true;
-
-            var sortedItems = currentItems
-                .OrderByDescending(x => x.SizeX * x.SizeY)
+            // --- Planning phase: compute the ideal target layout ---
+            // Sort: primary by item category (groups maps/currency/rings/etc. together),
+            //       then largest items first within each group (FFD packs most efficiently).
+            var packingOrder = currentItems
+                .OrderBy(x => GetItemCategory(x))
+                .ThenByDescending(x => x.SizeX * x.SizeY)
                 .ThenByDescending(x => x.SizeX)
+                .ThenBy(x => x.Item?.Path ?? "")
                 .ToList();
 
-            var moves = new List<(ServerInventory.InventSlotItem item, int tc, int tr)>();
-            foreach (var item in sortedItems)
+            var targetGrid = BuildIgnoredCellsGrid();
+            // targetMap key = item's CURRENT (PosX, PosY); value = computed target (col, row)
+            var targetMap = new Dictionary<(int, int), (int col, int row)>();
+            foreach (var item in packingOrder)
             {
-                var fit = FindFirstFit(grid, item.SizeX, item.SizeY);
+                var fit = FindFirstFit(targetGrid, item.SizeX, item.SizeY);
                 if (fit == null) continue;
                 var (tc, tr) = fit.Value;
-                for (var dr = 0; dr < item.SizeY; dr++)
-                    for (var dc = 0; dc < item.SizeX; dc++)
-                        grid[tc + dc, tr + dr] = true;
-                if (item.PosX != tc || item.PosY != tr)
-                    moves.Add((item, tc, tr));
+                for (var dy = 0; dy < item.SizeY; dy++)
+                    for (var dx = 0; dx < item.SizeX; dx++)
+                        targetGrid[tc + dx, tr + dy] = true;
+                targetMap[(item.PosX, item.PosY)] = (tc, tr);
             }
 
-            if (!moves.Any()) break; // Already at optimal layout
+            // --- Execution phase: move one item per iteration to an empty target ---
+            // Build current occupancy for collision checks.
+            var occupancy = BuildOccupancyGrid(currentItems);
 
-            var anyMoved = false;
-            var abort = false;
-            foreach (var (item, tc, tr) in moves)
+            // Try to find a "safe" move: item whose entire target area is currently free.
+            ServerInventory.InventSlotItem itemToMove = null;
+            int destCol = 0, destRow = 0;
+
+            foreach (var item in packingOrder)
             {
-                if (MoveCancellationRequested || !InGameState.IngameUi.InventoryPanel.IsVisible)
+                if (!targetMap.TryGetValue((item.PosX, item.PosY), out var target)) continue;
+                var (tc, tr) = target;
+                if (item.PosX == tc && item.PosY == tr) continue; // already in place
+
+                if (IsTargetAreaFree(occupancy, tc, tr, item.SizeX, item.SizeY, item.PosX, item.PosY, item.SizeX, item.SizeY))
                 {
-                    abort = true;
+                    itemToMove = item;
+                    destCol = tc;
+                    destRow = tr;
+                    break;
+                }
+            }
+
+            if (itemToMove == null)
+            {
+                // All moves are blocked (cycle). Break the deadlock by parking one item in
+                // any free region, which will free up space for other items next iteration.
+                var parkTarget = FindFirstFit(occupancy, 1, 1);
+                if (parkTarget == null) break; // Inventory truly full - nothing to do
+
+                // Pick the first item that still needs to move and can fit in a free region.
+                foreach (var candidate in packingOrder)
+                {
+                    if (!targetMap.TryGetValue((candidate.PosX, candidate.PosY), out var t)) continue;
+                    if (candidate.PosX == t.col && candidate.PosY == t.row) continue;
+
+                    // Temporarily unmark the candidate's own cells so FindFirstFit can find
+                    // a truly empty region elsewhere (not the item's own current position).
+                    var tempGrid = BuildOccupancyGrid(currentItems);
+                    for (var dy = 0; dy < candidate.SizeY; dy++)
+                        for (var dx = 0; dx < candidate.SizeX; dx++)
+                            tempGrid[candidate.PosX + dx, candidate.PosY + dy] = false;
+
+                    var parkFit = FindFirstFit(tempGrid, candidate.SizeX, candidate.SizeY);
+                    if (parkFit == null) continue;
+
+                    itemToMove = candidate;
+                    destCol = parkFit.Value.col;
+                    destRow = parkFit.Value.row;
                     break;
                 }
 
-                var srcCenter = GetInventorySlotCenter(inventoryRect, item.PosX, item.PosY);
-                var dstCenter = GetInventorySlotCenter(inventoryRect, tc, tr);
-
-                // Pick up item (left-click without Ctrl)
-                Mouse.moveMouse(srcCenter + WindowOffset);
-                await Wait(MouseMoveDelay, true);
-                Mouse.LeftDown();
-                await Wait(MouseDownDelay, true);
-                Mouse.LeftUp();
-                await Wait(KeyDelay, true);
-
-                // Place at target slot (left-click; game swaps if slot is occupied)
-                Mouse.moveMouse(dstCenter + WindowOffset);
-                await Wait(MouseMoveDelay, true);
-                Mouse.LeftDown();
-                await Wait(MouseDownDelay, true);
-                Mouse.LeftUp();
-                await Wait(KeyDelay, true);
-
-                anyMoved = true;
+                if (itemToMove == null) break; // Can't break the deadlock
             }
 
-            if (abort || !anyMoved) break;
+            // Execute the single move: pick up then place.
+            var srcCenter = GetInventorySlotCenter(inventoryRect, itemToMove.PosX, itemToMove.PosY);
+            var dstCenter = GetInventorySlotCenter(inventoryRect, destCol, destRow);
+
+            Mouse.moveMouse(srcCenter + WindowOffset);
+            await Wait(MouseMoveDelay, true);
+            Mouse.LeftDown();
+            await Wait(MouseDownDelay, true);
+            Mouse.LeftUp();
+            await Wait(KeyDelay, true);
+
+            Mouse.moveMouse(dstCenter + WindowOffset);
+            await Wait(MouseMoveDelay, true);
+            Mouse.LeftDown();
+            await Wait(MouseDownDelay, true);
+            Mouse.LeftUp();
+            await Wait(KeyDelay, true);
         }
 
         await StopMovingItems();
+        return true;
+    }
+
+    /// <summary>
+    /// Extracts a logical grouping category from an item's path so that the sort algorithm
+    /// keeps items of the same type (Maps, Currency, Rings, etc.) clustered together.
+    /// PoE item paths follow the pattern "Metadata/Items/[Category]/...".
+    /// </summary>
+    private static string GetItemCategory(ServerInventory.InventSlotItem item)
+    {
+        var path = item.Item?.Path ?? "";
+        var segments = path.Split('/');
+        // segments[0]="Metadata", segments[1]="Items", segments[2]="Maps"|"Currency"|"Rings"|...
+        return segments.Length > 2 ? segments[2] : "Misc";
+    }
+
+    /// <summary>
+    /// Builds a bool[12,5] occupancy grid where true = cell is occupied by an inventory item.
+    /// grid[col, row] — col is x (0–11), row is y (0–4).
+    /// </summary>
+    private static bool[,] BuildOccupancyGrid(IEnumerable<ServerInventory.InventSlotItem> items)
+    {
+        var grid = new bool[12, 5];
+        foreach (var item in items)
+        {
+            for (var dy = 0; dy < item.SizeY; dy++)
+                for (var dx = 0; dx < item.SizeX; dx++)
+                {
+                    var c = item.PosX + dx;
+                    var r = item.PosY + dy;
+                    if (c >= 0 && c < 12 && r >= 0 && r < 5)
+                        grid[c, r] = true;
+                }
+        }
+        return grid;
+    }
+
+    /// <summary>
+    /// Builds a bool[12,5] grid pre-populated only with ignored cells (as per settings).
+    /// Used as the starting grid for bin-packing layout computation.
+    /// </summary>
+    private bool[,] BuildIgnoredCellsGrid()
+    {
+        var grid = new bool[12, 5];
+        for (var r = 0; r < 5; r++)
+            for (var c = 0; c < 12; c++)
+                if (Settings.IgnoredCells[r, c]) grid[c, r] = true;
+        return grid;
+    }
+
+    /// <summary>
+    /// Returns true if the rectangular region [targetCol..+sizeX, targetRow..+sizeY] in the
+    /// occupancy grid is entirely free, except for cells that belong to the source item's own
+    /// current footprint (which will vacate when the item moves).
+    /// </summary>
+    private static bool IsTargetAreaFree(bool[,] occupancy,
+        int targetCol, int targetRow, int sizeX, int sizeY,
+        int srcCol, int srcRow, int srcSizeX, int srcSizeY)
+    {
+        if (targetCol < 0 || targetRow < 0 || targetCol + sizeX > 12 || targetRow + sizeY > 5)
+            return false;
+
+        for (var dy = 0; dy < sizeY; dy++)
+        {
+            for (var dx = 0; dx < sizeX; dx++)
+            {
+                var c = targetCol + dx;
+                var r = targetRow + dy;
+                if (!occupancy[c, r]) continue;
+
+                // Cell is occupied – is it within the source item's own footprint?
+                if (c >= srcCol && c < srcCol + srcSizeX && r >= srcRow && r < srcRow + srcSizeY)
+                    continue; // will be vacated when the item moves, so it's fine
+
+                return false; // occupied by a different item
+            }
+        }
         return true;
     }
 

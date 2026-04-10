@@ -809,12 +809,14 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         var (cellW, cellH, gridOriginX, gridOriginY) = CalibrateGridGeometry(initialItems, inventoryRect);
         Log($"SortInventory: grid geometry — cellW={cellW:F2} cellH={cellH:F2} originX={gridOriginX:F2} originY={gridOriginY:F2} windowOffset=({WindowOffset.X:F0},{WindowOffset.Y:F0})");
 
-        // Sort order: category → area desc → width desc → path → address.
+        // Sort order: category → area asc → width asc → path → address.
+        // Ascending size causes smaller (1×1) items to be packed into the leftmost columns first,
+        // so the left side of the inventory favours compact items and large items land on the right.
         // Address as final tiebreaker gives a completely stable ordering.
         var packingOrder = initialItems
             .OrderBy(GetItemCategory)
-            .ThenByDescending(x => x.SizeX * x.SizeY)
-            .ThenByDescending(x => x.SizeX)
+            .ThenBy(x => x.SizeX * x.SizeY)
+            .ThenBy(x => x.SizeX)
             .ThenBy(x => x.Item?.Path ?? "")
             .ThenBy(x => x.Item?.Address ?? 0)
             .ToList();
@@ -913,16 +915,17 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 // keep pendingOldAddress set so we retry the re-key next iteration.
             }
 
-            // Convergence check: every planned item is already at its target.
-            // Primary check: address-based (fast, accurate once plan keys are up-to-date).
-            // Secondary check: position-based guard — every plan target cell must have an item.
-            // The secondary check prevents a vacuous-true exit that could occur if address
-            // reconciliation hasn't caught up yet and the plan's Where() returns an empty set.
-            var done = rawInventoryItems
-                .Where(x => x.Item != null && plan.ContainsKey(x.Item.Address))
-                .All(x => { var t = plan[x.Item.Address]; return x.PosX == t.col && x.PosY == t.row; })
-                && plan.Values.All(t =>
-                    rawInventoryItems.Any(x => x.Item != null && x.PosX == t.col && x.PosY == t.row));
+            // Convergence check: every plan entry must have its item (by address) sitting at the
+            // plan target position.  Using plan.All(...) rather than a filtered Where(...).All(...)
+            // prevents vacuous-true exits when parked items have stale plan keys or when a re-key
+            // is still in flight.  We also gate on pendingOldAddress == 0 so the check never fires
+            // while we are still waiting for the server to confirm the last placement.
+            var done = pendingOldAddress == 0
+                && plan.All(kv => rawInventoryItems.Any(x =>
+                    x.Item != null
+                    && x.Item.Address == kv.Key
+                    && x.PosX == kv.Value.col
+                    && x.PosY == kv.Value.row));
             if (done)
             {
                 Log($"SortInventory: all items at target — done in {moveCount} moves");
@@ -1025,22 +1028,12 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                         for (var dx = 0; dx < it.SizeX; dx++)
                             tempGrid[it.PosX + dx, it.PosY + dy] = false;
 
-                    // Mark ALL plan target areas as off-limits (both pending and already-settled).
-                    // Iterating plan.Values directly (rather than filtering currentItems) protects
-                    // at-target items even when a server-data timing gap temporarily hides them
-                    // from currentItems, preventing an unwanted implicit swap that would displace
-                    // a settled item and leave it stranded on the cursor.
-                    foreach (var (tCol, tRow, tSizeX, tSizeY) in plan.Values)
-                    {
-                        for (var dy2 = 0; dy2 < tSizeY; dy2++)
-                            for (var dx2 = 0; dx2 < tSizeX; dx2++)
-                            {
-                                var tc = tCol + dx2;
-                                var tr = tRow + dy2;
-                                if (tc >= 0 && tc < 12 && tr >= 0 && tr < 5)
-                                    tempGrid[tc, tr] = true;
-                            }
-                    }
+                    // Note: we do NOT additionally mark plan target cells as off-limits here.
+                    // Previously all plan targets were blocked, which caused complete deadlock
+                    // when the inventory is nearly full and every free cell happens to be a
+                    // plan target.  Settled items (already at their plan targets) are already
+                    // protected by BuildOccupancyGrid above; free plan-target cells must remain
+                    // available as temporary park slots or the sort cannot make progress.
 
                     var parkSlot = FindFirstFitNotAt(tempGrid, it.SizeX, it.SizeY, it.PosX, it.PosY);
                     if (parkSlot == null)

@@ -264,7 +264,11 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             if (IsButtonPressed(buttonRect) ||
                 Input.IsKeyDown(Settings.MoveToInventoryHotkey.Value))
             {
-                var orderedItems = highlightedItems
+                // When no items are highlighted and no custom filter is active, move ALL visible stash items
+                var itemsToMove = (isCustomFilter || highlightedItems.Any())
+                    ? highlightedItems
+                    : inventory.VisibleInventoryItems.ToList();
+                var orderedItems = itemsToMove
                     .OrderBy(stashItem => stashItem.GetClientRectCache.X)
                     .ThenBy(stashItem => stashItem.GetClientRectCache.Y)
                     .ToList();
@@ -327,6 +331,23 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                         .ToList();
 
                     _currentOperation = MoveItemsToStash(inventoryItems);
+                }
+            }
+
+            if (Settings.SortButtonEnable)
+            {
+                // Sort button: to the right of the move-to-stash button
+                var sortButtonPos = inventoryRect.TopLeft.ToVector2Num() + new Vector2(buttonSize / 2 + buttonSize + 4, -buttonSize);
+                var sortButtonRect = new SharpDX.RectangleF(sortButtonPos.X, sortButtonPos.Y, buttonSize, buttonSize);
+
+                Graphics.DrawFrame(sortButtonRect.TopLeft.ToVector2Num(), sortButtonRect.BottomRight.ToVector2Num(), SharpDX.Color.White, 2);
+                var sortLabelPos = new Vector2(sortButtonRect.Center.X, sortButtonRect.Center.Y - 10);
+                Graphics.DrawText("Sort", sortLabelPos with { X = sortLabelPos.X + 1 }, SharpDX.Color.Black, FontAlign.Center);
+                Graphics.DrawText("Sort", sortLabelPos, SharpDX.Color.White, FontAlign.Center);
+
+                if (IsButtonPressed(sortButtonRect) || Input.IsKeyDown(Settings.SortInventoryHotkey.Value))
+                {
+                    _currentOperation = SortInventory(inventoryRect);
                 }
             }
         }
@@ -685,5 +706,114 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
 
         ImGui.EndChild();
         ImGui.EndChild();
+    }
+
+    private async SyncTask<bool> SortInventory(SharpDX.RectangleF inventoryRect)
+    {
+        if (!await MoveItemsCommonPreamble()) return false;
+        _prevMousePos = Mouse.GetCursorPosition();
+
+        const int MaxPasses = 4;
+        for (var pass = 0; pass < MaxPasses; pass++)
+        {
+            if (MoveCancellationRequested) { await StopMovingItems(); return false; }
+            if (!InGameState.IngameUi.InventoryPanel.IsVisible) break;
+
+            var currentItems = GameController.IngameState.ServerData.PlayerInventories[0].Inventory.InventorySlotItems
+                .Where(x => !IsInIgnoreCell(x))
+                .ToList();
+
+            if (!currentItems.Any()) break;
+
+            // Compute optimal target positions via First-Fit Decreasing bin packing
+            var grid = new bool[12, 5];
+            // Mark ignored cells as occupied
+            for (var r = 0; r < 5; r++)
+                for (var c = 0; c < 12; c++)
+                    if (Settings.IgnoredCells[r, c]) grid[c, r] = true;
+
+            var sortedItems = currentItems
+                .OrderByDescending(x => x.SizeX * x.SizeY)
+                .ThenByDescending(x => x.SizeX)
+                .ToList();
+
+            var moves = new List<(ServerInventory.InventSlotItem item, int tc, int tr)>();
+            foreach (var item in sortedItems)
+            {
+                var fit = FindFirstFit(grid, item.SizeX, item.SizeY);
+                if (fit == null) continue;
+                var (tc, tr) = fit.Value;
+                for (var dr = 0; dr < item.SizeY; dr++)
+                    for (var dc = 0; dc < item.SizeX; dc++)
+                        grid[tc + dc, tr + dr] = true;
+                if (item.PosX != tc || item.PosY != tr)
+                    moves.Add((item, tc, tr));
+            }
+
+            if (!moves.Any()) break; // Already at optimal layout
+
+            var anyMoved = false;
+            var abort = false;
+            foreach (var (item, tc, tr) in moves)
+            {
+                if (MoveCancellationRequested || !InGameState.IngameUi.InventoryPanel.IsVisible)
+                {
+                    abort = true;
+                    break;
+                }
+
+                var srcCenter = GetInventorySlotCenter(inventoryRect, item.PosX, item.PosY);
+                var dstCenter = GetInventorySlotCenter(inventoryRect, tc, tr);
+
+                // Pick up item (left-click without Ctrl)
+                Mouse.moveMouse(srcCenter + WindowOffset);
+                await Wait(MouseMoveDelay, true);
+                Mouse.LeftDown();
+                await Wait(MouseDownDelay, true);
+                Mouse.LeftUp();
+                await Wait(KeyDelay, true);
+
+                // Place at target slot (left-click; game swaps if slot is occupied)
+                Mouse.moveMouse(dstCenter + WindowOffset);
+                await Wait(MouseMoveDelay, true);
+                Mouse.LeftDown();
+                await Wait(MouseDownDelay, true);
+                Mouse.LeftUp();
+                await Wait(KeyDelay, true);
+
+                anyMoved = true;
+            }
+
+            if (abort || !anyMoved) break;
+        }
+
+        await StopMovingItems();
+        return true;
+    }
+
+    private static (int col, int row)? FindFirstFit(bool[,] grid, int width, int height)
+    {
+        for (var row = 0; row <= 5 - height; row++)
+        {
+            for (var col = 0; col <= 12 - width; col++)
+            {
+                var fits = true;
+                for (var dr = 0; dr < height && fits; dr++)
+                    for (var dc = 0; dc < width && fits; dc++)
+                        if (grid[col + dc, row + dr]) fits = false;
+                if (fits) return (col, row);
+            }
+        }
+        return null;
+    }
+
+    private static SharpDX.Vector2 GetInventorySlotCenter(SharpDX.RectangleF inventoryRect, int col, int row)
+    {
+        var cellW = inventoryRect.Width / 12f;
+        var cellH = inventoryRect.Height / 5f;
+        return new SharpDX.Vector2(
+            inventoryRect.X + (col + 0.5f) * cellW,
+            inventoryRect.Y + (row + 0.5f) * cellH
+        );
     }
 }

@@ -846,6 +846,13 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         const int MaxMoves = 120;
         var moveCount = 0;
 
+        // PoE creates a new InventSlotItem (new Item.Address) each time an item is placed in a
+        // slot, so a moved item's address no longer matches the key we stored in plan.  Track
+        // the last move's old address and destination so we can re-key the plan entry once the
+        // server reflects the placement at the start of the next loop iteration.
+        long pendingOldAddress = 0;
+        int pendingDestCol = -1, pendingDestRow = -1;
+
         while (moveCount < MaxMoves)
         {
             if (MoveCancellationRequested)
@@ -871,16 +878,44 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 break;
             }
 
-            // Convergence check: every planned item is already at its target.
             // Use the raw server inventory rather than the filtered currentItems so that a plan
             // item currently held on the cursor (which appears with out-of-bounds PosX/PosY and
-            // is therefore excluded from currentItems) is also considered.  A cursor-held item
-            // has coordinates outside [0,12)×[0,5), which will never equal its target slot, so
-            // it correctly prevents a false "all items at target" result.
+            // is therefore excluded from currentItems) is also considered.
             var rawInventoryItems = GameController.IngameState.ServerData.PlayerInventories[0].Inventory.InventorySlotItems;
+
+            // ── Plan-key reconciliation ─────────────────────────────────────────────────────
+            // PoE assigns a new Item.Address when an item lands in a new slot.  Re-key the plan
+            // entry for the item we placed last iteration: find whatever is sitting at the
+            // destination now and, if its address differs from the one we moved, transfer the
+            // plan entry to the new address so the item remains trackable.
+            if (pendingOldAddress != 0)
+            {
+                var newItem = rawInventoryItems.FirstOrDefault(x =>
+                    x.Item != null && x.PosX == pendingDestCol && x.PosY == pendingDestRow);
+                if (newItem != null)
+                {
+                    if (newItem.Item.Address != pendingOldAddress && plan.ContainsKey(pendingOldAddress))
+                    {
+                        Log($"SortInventory: re-keyed plan entry 0x{pendingOldAddress:X} → 0x{newItem.Item.Address:X} at ({pendingDestCol},{pendingDestRow})");
+                        plan[newItem.Item.Address] = plan[pendingOldAddress];
+                        plan.Remove(pendingOldAddress);
+                    }
+                    pendingOldAddress = 0; // confirmed — item found at destination
+                }
+                // If the item is not yet visible at the destination (server still catching up),
+                // keep pendingOldAddress set so we retry the re-key next iteration.
+            }
+
+            // Convergence check: every planned item is already at its target.
+            // Primary check: address-based (fast, accurate once plan keys are up-to-date).
+            // Secondary check: position-based guard — every plan target cell must have an item.
+            // The secondary check prevents a vacuous-true exit that could occur if address
+            // reconciliation hasn't caught up yet and the plan's Where() returns an empty set.
             var done = rawInventoryItems
                 .Where(x => x.Item != null && plan.ContainsKey(x.Item.Address))
-                .All(x => { var t = plan[x.Item.Address]; return x.PosX == t.col && x.PosY == t.row; });
+                .All(x => { var t = plan[x.Item.Address]; return x.PosX == t.col && x.PosY == t.row; })
+                && plan.Values.All(t =>
+                    rawInventoryItems.Any(x => x.Item != null && x.PosX == t.col && x.PosY == t.row));
             if (done)
             {
                 Log($"SortInventory: all items at target — done in {moveCount} moves");
@@ -936,6 +971,9 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                     await Wait(MouseDownDelay, true);
                     Mouse.LeftUp();
                     await Wait(KeyDelay, true);
+                    pendingOldAddress = heldItem.Item.Address;
+                    pendingDestCol = hCol;
+                    pendingDestRow = hRow;
                     moveCount++;
                     continue;
                 }
@@ -1060,6 +1098,12 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             await Wait(MouseDownDelay, true);
             Mouse.LeftUp();
             await Wait(KeyDelay, true);
+
+            // Record the old address and destination so the plan key can be re-keyed
+            // at the start of the next iteration once the server reflects the placement.
+            pendingOldAddress = itemToMove.Item.Address;
+            pendingDestCol = destCol;
+            pendingDestRow = destRow;
 
             moveCount++;
         }

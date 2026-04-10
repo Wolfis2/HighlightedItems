@@ -384,8 +384,6 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         }
 
         _prevMousePos = Mouse.GetCursorPosition();
-        Keyboard.KeyDown(Keys.LControlKey);
-        await Wait(KeyDelay, true);
         for (var i = 0; i < items.Count; i++)
         {
             var item = items[i];
@@ -408,7 +406,12 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 break;
             }
 
-            await MoveItem(item.GetClientRect().Center);
+            var isStackable = item.Item?.GetComponent<Stack>() != null;
+            Keyboard.KeyDown(Keys.LControlKey);
+            await Wait(KeyDelay, true);
+            await MoveItem(item.GetClientRect().Center, isStackable);
+            Keyboard.KeyUp(Keys.LControlKey);
+            await Wait(KeyDelay, true);
         }
 
         await StopMovingItems();
@@ -438,8 +441,6 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         }
 
         _prevMousePos = Mouse.GetCursorPosition();
-        Keyboard.KeyDown(Keys.LControlKey);
-        await Wait(KeyDelay, true);
         for (var i = 0; i < items.Count; i++)
         {
             var item = items[i];
@@ -468,7 +469,12 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 break;
             }
 
-            await MoveItem(item.GetClientRect().Center);
+            var isStackable = item.Item?.GetComponent<Stack>() != null;
+            Keyboard.KeyDown(Keys.LControlKey);
+            await Wait(KeyDelay, true);
+            await MoveItem(item.GetClientRect().Center, isStackable);
+            Keyboard.KeyUp(Keys.LControlKey);
+            await Wait(KeyDelay, true);
         }
 
         await StopMovingItems();
@@ -553,14 +559,16 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
     private TimeSpan MouseDownDelay => TimeSpan.FromMilliseconds(25 + Settings.ExtraDelay.Value);
     private static readonly TimeSpan MouseUpDelay = TimeSpan.FromMilliseconds(5);
 
-    private async SyncTask<bool> MoveItem(SharpDX.Vector2 itemPosition)
+    private async SyncTask<bool> MoveItem(SharpDX.Vector2 itemPosition, bool isStackable = false)
     {
         itemPosition += WindowOffset;
         Mouse.moveMouse(itemPosition);
         await Wait(MouseMoveDelay, true);
-        Mouse.LeftDown();
+        var mouseDown = isStackable ? (Action)Mouse.RightDown : Mouse.LeftDown;
+        var mouseUp = isStackable ? (Action)Mouse.RightUp : Mouse.LeftUp;
+        mouseDown();
         await Wait(MouseDownDelay, true);
-        Mouse.LeftUp();
+        mouseUp();
         await Wait(MouseUpDelay, true);
         return true;
     }

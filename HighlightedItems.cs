@@ -532,47 +532,57 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
 
     private bool IsInventoryFull()
     {
-        var inventoryItems = GameController.IngameState.ServerData.PlayerInventories[0].Inventory.InventorySlotItems;
-
-        // quick sanity check
-        if (inventoryItems.Count < 12)
+        try
         {
+            var inventoryItems = GameController.IngameState.ServerData.PlayerInventories[0].Inventory.InventorySlotItems;
+
+            // quick sanity check
+            if (inventoryItems.Count < 12)
+            {
+                return false;
+            }
+
+            // track each inventory slot
+            bool[,] inventorySlot = new bool[12, 5];
+
+            // iterate through each item in the inventory and mark used slots
+            // clamp loop bounds to avoid IndexOutOfRangeException for items with invalid positions
+            // (ExileCore can return items with PosX/PosY outside the 12x5 grid, e.g. cursor-held items)
+            foreach (var inventoryItem in inventoryItems)
+            {
+                int x = inventoryItem.PosX;
+                int y = inventoryItem.PosY;
+                int height = inventoryItem.SizeY;
+                int width = inventoryItem.SizeX;
+                for (int row = Math.Max(0, x); row < Math.Min(12, x + width); row++)
+                {
+                    for (int col = Math.Max(0, y); col < Math.Min(5, y + height); col++)
+                    {
+                        inventorySlot[row, col] = true;
+                    }
+                }
+            }
+
+            // check for any empty slots
+            for (int x = 0; x < 12; x++)
+            {
+                for (int y = 0; y < 5; y++)
+                {
+                    if (inventorySlot[x, y] == false)
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            // no empty slots, so inventory is full
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DebugWindow.LogError($"HighlightedItems: IsInventoryFull check failed: {ex.Message}");
             return false;
         }
-
-        // track each inventory slot
-        bool[,] inventorySlot = new bool[12, 5];
-
-        // iterate through each item in the inventory and mark used slots
-        foreach (var inventoryItem in inventoryItems)
-        {
-            int x = inventoryItem.PosX;
-            int y = inventoryItem.PosY;
-            int height = inventoryItem.SizeY;
-            int width = inventoryItem.SizeX;
-            for (int row = x; row < x + width; row++)
-            {
-                for (int col = y; col < y + height; col++)
-                {
-                    inventorySlot[row, col] = true;
-                }
-            }
-        }
-
-        // check for any empty slots
-        for (int x = 0; x < 12; x++)
-        {
-            for (int y = 0; y < 5; y++)
-            {
-                if (inventorySlot[x, y] == false)
-                {
-                    return false;
-                }
-            }
-        }
-
-        // no empty slots, so inventory is full
-        return true;
     }
 
     private static readonly TimeSpan KeyDelay = TimeSpan.FromMilliseconds(10);

@@ -872,7 +872,13 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             }
 
             // Convergence check: every planned item is already at its target.
-            var done = currentItems
+            // Use the raw server inventory rather than the filtered currentItems so that a plan
+            // item currently held on the cursor (which appears with out-of-bounds PosX/PosY and
+            // is therefore excluded from currentItems) is also considered.  A cursor-held item
+            // has coordinates outside [0,12)×[0,5), which will never equal its target slot, so
+            // it correctly prevents a false "all items at target" result.
+            var rawInventoryItems = GameController.IngameState.ServerData.PlayerInventories[0].Inventory.InventorySlotItems;
+            var done = rawInventoryItems
                 .Where(x => x.Item != null && plan.ContainsKey(x.Item.Address))
                 .All(x => { var t = plan[x.Item.Address]; return x.PosX == t.col && x.PosY == t.row; });
             if (done)
@@ -883,6 +889,58 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
 
             // Find a "safe" move: item not at its target AND the target area is currently free.
             var occupancy = BuildOccupancyGrid(currentItems);
+
+            // ── Cursor-held item recovery ──────────────────────────────────────────────────────
+            // PoE can perform an implicit swap during a placement (e.g. when the destination click
+            // lands on a different item), leaving a plan item on the cursor.  Cursor-held items
+            // appear in the raw server inventory with out-of-bounds PosX/PosY.  Detect this and
+            // issue a destination-only click (the item is already on the cursor; no pickup click
+            // is needed) to place it and keep the sort running.
+            {
+                var rawForCursor = GameController.IngameState.ServerData.PlayerInventories[0].Inventory.InventorySlotItems;
+                var heldItem = rawForCursor.FirstOrDefault(x =>
+                    x.Item != null && plan.ContainsKey(x.Item.Address) &&
+                    (x.PosX < 0 || x.PosX >= 12 || x.PosY < 0 || x.PosY >= 5));
+                if (heldItem != null)
+                {
+                    var hTarget = plan[heldItem.Item.Address];
+                    int hCol, hRow;
+                    // Prefer placing directly at the planned target; fall back to any free slot.
+                    if (IsTargetAreaFree(occupancy, hTarget.col, hTarget.row,
+                            heldItem.SizeX, heldItem.SizeY, -1, -1, 0, 0))
+                    {
+                        hCol = hTarget.col;
+                        hRow = hTarget.row;
+                    }
+                    else
+                    {
+                        var parkSlot = FindFirstFitNotAt(occupancy, heldItem.SizeX, heldItem.SizeY, -1, -1);
+                        if (parkSlot == null)
+                        {
+                            Log($"SortInventory: cursor-held {heldItem.Item.Path} ({heldItem.SizeX}x{heldItem.SizeY}) — no free slot, stopping");
+                            break;
+                        }
+                        hCol = parkSlot.Value.col;
+                        hRow = parkSlot.Value.row;
+                    }
+                    var hDst = new SharpDX.Vector2(
+                        gridOriginX + (hCol + heldItem.SizeX / 2 + 0.5f) * cellW,
+                        gridOriginY + (hRow + heldItem.SizeY / 2 + 0.5f) * cellH);
+                    Log($"SortInventory: move #{moveCount + 1} — cursor-held {heldItem.Item.Path} " +
+                        $"({heldItem.SizeX}x{heldItem.SizeY}) → ({hCol},{hRow}) | " +
+                        $"dst=({hDst.X:F0},{hDst.Y:F0}) " +
+                        $"dst+offset=({hDst.X + WindowOffset.X:F0},{hDst.Y + WindowOffset.Y:F0})");
+                    Mouse.moveMouse(hDst + WindowOffset);
+                    await Wait(MouseMoveDelay, true);
+                    Mouse.LeftDown();
+                    await Wait(MouseDownDelay, true);
+                    Mouse.LeftUp();
+                    await Wait(KeyDelay, true);
+                    moveCount++;
+                    continue;
+                }
+            }
+
             ServerInventory.InventSlotItem itemToMove = null;
             int destCol = 0, destRow = 0;
             foreach (var it in currentItems)
@@ -911,6 +969,25 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                     for (var dy = 0; dy < it.SizeY; dy++)
                         for (var dx = 0; dx < it.SizeX; dx++)
                             tempGrid[it.PosX + dx, it.PosY + dy] = false;
+
+                    // Mark the final target areas of all OTHER pending items as off-limits.
+                    // Without this, the park slot could overlap a sibling item's destination,
+                    // causing PoE to perform an unwanted implicit swap on the next placement
+                    // and leaving that sibling item stranded on the cursor.
+                    foreach (var other in currentItems)
+                    {
+                        if (other == it || other.Item == null) continue;
+                        if (!plan.TryGetValue(other.Item.Address, out var otherTarget)) continue;
+                        if (other.PosX == otherTarget.col && other.PosY == otherTarget.row) continue;
+                        for (var dy2 = 0; dy2 < other.SizeY; dy2++)
+                            for (var dx2 = 0; dx2 < other.SizeX; dx2++)
+                            {
+                                var tc = otherTarget.col + dx2;
+                                var tr = otherTarget.row + dy2;
+                                if (tc >= 0 && tc < 12 && tr >= 0 && tr < 5)
+                                    tempGrid[tc, tr] = true;
+                            }
+                    }
 
                     var parkSlot = FindFirstFitNotAt(tempGrid, it.SizeX, it.SizeY, it.PosX, it.PosY);
                     if (parkSlot == null)

@@ -463,13 +463,10 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         }
 
         _prevMousePos = Mouse.GetCursorPosition();
-        var processedIndices = new HashSet<int>();
         for (var i = 0; i < items.Count; i++)
         {
-            if (processedIndices.Contains(i))
-                continue;
-
             var item = items[i];
+            _itemsToMove = items[i..].Select(x => x.GetClientRectCache).ToList();
             if (MoveCancellationRequested)
             {
                 await StopMovingItems();
@@ -494,24 +491,11 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 break;
             }
 
-            var isStackable = item.Item?.GetComponent<Stack>() != null;
-            if (isStackable)
-            {
-                var itemPath = item.Item?.Path ?? "";
-                for (var j = i + 1; j < items.Count; j++)
-                {
-                    if (items[j].Item?.Path == itemPath)
-                        processedIndices.Add(j);
-                }
-            }
-            _itemsToMove = items.Where((_, idx) => !processedIndices.Contains(idx)).Select(x => x.GetClientRectCache).ToList();
-
             Keyboard.KeyDown(Keys.LControlKey);
             await Wait(KeyDelay, true);
-            await MoveItem(item.GetClientRect().Center, isStackable);
+            await MoveItem(item.GetClientRect().Center);
             Keyboard.KeyUp(Keys.LControlKey);
             await Wait(KeyDelay, true);
-            processedIndices.Add(i);
         }
 
         await StopMovingItems();

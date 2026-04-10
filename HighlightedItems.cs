@@ -724,10 +724,18 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             .Where(x => !IsInIgnoreCell(x))
             .ToList();
 
-        if (!initialItems.Any()) { await StopMovingItems(); return true; }
+        DebugWindow.LogMsg($"[Sort] Starting sort. Items found (excl. ignored cells): {initialItems.Count}");
+
+        if (!initialItems.Any())
+        {
+            DebugWindow.LogMsg("[Sort] No items to sort. Aborting.");
+            await StopMovingItems();
+            return true;
+        }
 
         // Derive pixel grid geometry once from on-screen item rects.
         var (cellW, cellH, gridOriginX, gridOriginY) = CalibrateGridGeometry(initialItems, inventoryRect);
+        DebugWindow.LogMsg($"[Sort] Grid geometry — cellW={cellW:F1} cellH={cellH:F1} originX={gridOriginX:F1} originY={gridOriginY:F1}");
 
         // Sort order: category → area desc → width desc → path → address.
         // Address as final tiebreaker gives a completely stable ordering.
@@ -746,12 +754,19 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         {
             if (it.Item == null) continue;
             var fit = FindFirstFit(targetGrid, it.SizeX, it.SizeY);
-            if (fit == null) continue; // no room; leave this item in place
+            if (fit == null)
+            {
+                DebugWindow.LogMsg($"[Sort] NOFIT — {it.Item.Path} ({it.SizeX}x{it.SizeY}) at ({it.PosX},{it.PosY}) — no slot found, leaving in place");
+                continue;
+            }
             plan[it.Item.Address] = (fit.Value.col, fit.Value.row, it.SizeX, it.SizeY);
+            DebugWindow.LogMsg($"[Sort] Plan: {it.Item.Path} ({it.SizeX}x{it.SizeY}) ({it.PosX},{it.PosY}) → ({fit.Value.col},{fit.Value.row})");
             for (var dy = 0; dy < it.SizeY; dy++)
                 for (var dx = 0; dx < it.SizeX; dx++)
                     targetGrid[fit.Value.col + dx, fit.Value.row + dy] = true;
         }
+
+        DebugWindow.LogMsg($"[Sort] Plan complete: {plan.Count}/{initialItems.Count} items assigned targets");
 
         // ── PHASE 2: Execute the plan move by move ────────────────────────────────────
         // Hard upper bound: 120 moves covers any realistic 12×5 inventory (60 items × 2 moves
@@ -761,21 +776,38 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
 
         while (moveCount < MaxMoves)
         {
-            if (MoveCancellationRequested) { await StopMovingItems(); return false; }
-            if (!InGameState.IngameUi.InventoryPanel.IsVisible) break;
+            if (MoveCancellationRequested)
+            {
+                DebugWindow.LogMsg("[Sort] Cancelled by right-click.");
+                await StopMovingItems();
+                return false;
+            }
+            if (!InGameState.IngameUi.InventoryPanel.IsVisible)
+            {
+                DebugWindow.LogMsg("[Sort] Inventory panel no longer visible — stopping.");
+                break;
+            }
 
             // Re-read current positions every iteration so we always have an accurate view.
             var currentItems = GameController.IngameState.ServerData.PlayerInventories[0].Inventory.InventorySlotItems
                 .Where(x => !IsInIgnoreCell(x))
                 .ToList();
 
-            if (!currentItems.Any()) break;
+            if (!currentItems.Any())
+            {
+                DebugWindow.LogMsg("[Sort] currentItems is empty — stopping.");
+                break;
+            }
 
             // Convergence check: every planned item is already at its target.
             var done = currentItems
                 .Where(x => x.Item != null && plan.ContainsKey(x.Item.Address))
                 .All(x => { var t = plan[x.Item.Address]; return x.PosX == t.col && x.PosY == t.row; });
-            if (done) break;
+            if (done)
+            {
+                DebugWindow.LogMsg($"[Sort] All items at target. Done in {moveCount} moves.");
+                break;
+            }
 
             // Find a "safe" move: item not at its target AND the target area is currently free.
             var occupancy = BuildOccupancyGrid(currentItems);
@@ -797,6 +829,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             // Break the cycle by parking one blocked item in any free area that is NOT its own cell.
             if (itemToMove == null)
             {
+                DebugWindow.LogMsg("[Sort] Deadlock detected — finding park slot");
                 foreach (var it in currentItems)
                 {
                     if (it.Item == null || !plan.TryGetValue(it.Item.Address, out var target)) continue;
@@ -808,8 +841,13 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                             tempGrid[it.PosX + dx, it.PosY + dy] = false;
 
                     var parkSlot = FindFirstFitNotAt(tempGrid, it.SizeX, it.SizeY, it.PosX, it.PosY);
-                    if (parkSlot == null) continue;
+                    if (parkSlot == null)
+                    {
+                        DebugWindow.LogMsg($"[Sort] No park slot for {it.Item.Path} ({it.SizeX}x{it.SizeY}) at ({it.PosX},{it.PosY})");
+                        continue;
+                    }
 
+                    DebugWindow.LogMsg($"[Sort] Parking {it.Item.Path} ({it.SizeX}x{it.SizeY}) from ({it.PosX},{it.PosY}) → park ({parkSlot.Value.col},{parkSlot.Value.row})");
                     itemToMove = it;
                     destCol = parkSlot.Value.col;
                     destRow = parkSlot.Value.row;
@@ -817,7 +855,11 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 }
             }
 
-            if (itemToMove == null) break;
+            if (itemToMove == null)
+            {
+                DebugWindow.LogMsg("[Sort] No moveable item found (deadlock unresolvable). Stopping.");
+                break;
+            }
 
             // Source: click the centre of the item's anchor cell.
             // PoE attaches the held item to the cursor at the clicked cell (the "anchor").
@@ -838,6 +880,11 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 gridOriginX + (destCol + itemToMove.SizeX / 2 + 0.5f) * cellW,
                 gridOriginY + (destRow + itemToMove.SizeY / 2 + 0.5f) * cellH);
 
+            DebugWindow.LogMsg($"[Sort] Move #{moveCount + 1}: {itemToMove.Item?.Path} ({itemToMove.SizeX}x{itemToMove.SizeY}) " +
+                               $"grid ({itemToMove.PosX},{itemToMove.PosY}) → ({destCol},{destRow}) | " +
+                               $"itemRect=({itemRect.X:F0},{itemRect.Y:F0},{itemRect.Width:F0}x{itemRect.Height:F0}) " +
+                               $"src=({srcCenter.X:F0},{srcCenter.Y:F0}) dst=({dstCenter.X:F0},{dstCenter.Y:F0})");
+
             // Pick up (left-click on source).
             Mouse.moveMouse(srcCenter + WindowOffset);
             await Wait(MouseMoveDelay, true);
@@ -857,6 +904,10 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             moveCount++;
         }
 
+        if (moveCount >= MaxMoves)
+            DebugWindow.LogMsg($"[Sort] Reached move limit ({MaxMoves}). Stopping.");
+
+        DebugWindow.LogMsg($"[Sort] Finished. Total moves: {moveCount}");
         await StopMovingItems();
         return true;
     }

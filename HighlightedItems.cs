@@ -826,13 +826,16 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 itemRect.X + srcCellW * 0.5f,
                 itemRect.Y + srcCellH * 0.5f);
 
-            // Destination: click at the item's CENTER over the target slot.
-            // In PoE, a held item is always centered on the cursor, so to land the item's
-            // top-left corner at (destCol, destRow) we must click at the midpoint of the
-            // item's full footprint: (destCol + SizeX/2, destRow + SizeY/2).
+            // Destination: click at the CENTER of PoE's anchor cell for this item.
+            // PoE's anchor = floor(SizeX/2) columns and floor(SizeY/2) rows from the item's
+            // top-left corner (integer division).  We must click at the CENTER of that cell
+            // (add 0.5) so we reliably land inside it, not on a cell boundary.
+            // Example: 2×4 item → anchor cell is (1,2) from TL; click at col (destCol+1+0.5)
+            //          and row (destRow+2+0.5).  Using float division (/ 2.0f) would give
+            //          1.0 / 2.0 instead of 1.5 / 2.5 for even sizes, landing on the boundary.
             var dstCenter = new SharpDX.Vector2(
-                gridOriginX + (destCol + itemToMove.SizeX / 2.0f) * cellW,
-                gridOriginY + (destRow + itemToMove.SizeY / 2.0f) * cellH);
+                gridOriginX + (destCol + itemToMove.SizeX / 2 + 0.5f) * cellW,
+                gridOriginY + (destRow + itemToMove.SizeY / 2 + 0.5f) * cellH);
 
             // Pick up (left-click on source; no modifier = plain grab).
             Mouse.moveMouse(srcCenter + WindowOffset);
@@ -968,9 +971,12 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
 
     private static (int col, int row)? FindFirstFit(bool[,] grid, int width, int height)
     {
-        for (var row = 0; row <= 5 - height; row++)
+        // Scan column-first so items are packed towards the left side of the inventory.
+        // col is the outer loop (0..11) and row is the inner loop (0..4), which fills
+        // the leftmost column top-to-bottom before moving to the next column.
+        for (var col = 0; col <= 12 - width; col++)
         {
-            for (var col = 0; col <= 12 - width; col++)
+            for (var row = 0; row <= 5 - height; row++)
             {
                 var fits = true;
                 for (var dr = 0; dr < height && fits; dr++)
@@ -989,9 +995,10 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
     private static (int col, int row)? FindFirstFitNotAt(
         bool[,] grid, int width, int height, int excludeCol, int excludeRow)
     {
-        for (var row = 0; row <= 5 - height; row++)
+        // Column-first scan mirrors FindFirstFit for consistent left-side-first packing.
+        for (var col = 0; col <= 12 - width; col++)
         {
-            for (var col = 0; col <= 12 - width; col++)
+            for (var row = 0; row <= 5 - height; row++)
             {
                 if (col == excludeCol && row == excludeRow) continue;
                 var fits = true;

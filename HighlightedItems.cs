@@ -12,6 +12,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Threading;
 using ExileCore.PoEMemory.Components;
 using ExileCore.Shared;
@@ -24,6 +25,12 @@ namespace HighlightedItems;
 
 public class HighlightedItems : BaseSettingsPlugin<Settings>
 {
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, IntPtr dwExtraInfo);
+
+    private const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
+    private const uint MOUSEEVENTF_RIGHTUP = 0x0010;
+
     private SyncTask<bool> _currentOperation;
     private string _customStashFilter = "";
     private string _customInventoryFilter = "";
@@ -384,10 +391,13 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         }
 
         _prevMousePos = Mouse.GetCursorPosition();
+        var processedIndices = new HashSet<int>();
         for (var i = 0; i < items.Count; i++)
         {
+            if (processedIndices.Contains(i))
+                continue;
+
             var item = items[i];
-            _itemsToMove = items[i..].Select(x => x.GetClientRect()).ToList();
             if (MoveCancellationRequested) 
             {
                 await StopMovingItems();
@@ -407,6 +417,18 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             }
 
             var isStackable = item.Item?.GetComponent<Stack>() != null;
+            if (isStackable)
+            {
+                var itemPath = item.Item?.Path ?? "";
+                for (var j = i + 1; j < items.Count; j++)
+                {
+                    if (items[j].Item?.Path == itemPath)
+                        processedIndices.Add(j);
+                }
+            }
+            processedIndices.Add(i);
+            _itemsToMove = items.Where((_, idx) => !processedIndices.Contains(idx)).Select(x => x.GetClientRect()).ToList();
+
             Keyboard.KeyDown(Keys.LControlKey);
             await Wait(KeyDelay, true);
             await MoveItem(item.GetClientRect().Center, isStackable);
@@ -441,10 +463,13 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         }
 
         _prevMousePos = Mouse.GetCursorPosition();
+        var processedIndices = new HashSet<int>();
         for (var i = 0; i < items.Count; i++)
         {
+            if (processedIndices.Contains(i))
+                continue;
+
             var item = items[i];
-            _itemsToMove = items[i..].Select(x => x.GetClientRectCache).ToList();
             if (MoveCancellationRequested)
             {
                 await StopMovingItems();
@@ -470,6 +495,18 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             }
 
             var isStackable = item.Item?.GetComponent<Stack>() != null;
+            if (isStackable)
+            {
+                var itemPath = item.Item?.Path ?? "";
+                for (var j = i + 1; j < items.Count; j++)
+                {
+                    if (items[j].Item?.Path == itemPath)
+                        processedIndices.Add(j);
+                }
+            }
+            processedIndices.Add(i);
+            _itemsToMove = items.Where((_, idx) => !processedIndices.Contains(idx)).Select(x => x.GetClientRectCache).ToList();
+
             Keyboard.KeyDown(Keys.LControlKey);
             await Wait(KeyDelay, true);
             await MoveItem(item.GetClientRect().Center, isStackable);
@@ -564,11 +601,20 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         itemPosition += WindowOffset;
         Mouse.moveMouse(itemPosition);
         await Wait(MouseMoveDelay, true);
-        var mouseDown = isStackable ? (Action)Mouse.RightDown : Mouse.LeftDown;
-        var mouseUp = isStackable ? (Action)Mouse.RightUp : Mouse.LeftUp;
-        mouseDown();
-        await Wait(MouseDownDelay, true);
-        mouseUp();
+        if (isStackable)
+        {
+            uint x = (uint)itemPosition.X;
+            uint y = (uint)itemPosition.Y;
+            mouse_event(MOUSEEVENTF_RIGHTDOWN, x, y, 0, IntPtr.Zero);
+            await Wait(MouseDownDelay, true);
+            mouse_event(MOUSEEVENTF_RIGHTUP, x, y, 0, IntPtr.Zero);
+        }
+        else
+        {
+            Mouse.LeftDown();
+            await Wait(MouseDownDelay, true);
+            Mouse.LeftUp();
+        }
         await Wait(MouseUpDelay, true);
         return true;
     }

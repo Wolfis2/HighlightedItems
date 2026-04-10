@@ -35,6 +35,29 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
     private string _customStashFilter = "";
     private string _customInventoryFilter = "";
 
+    private readonly object _logLock = new();
+    private string _logFilePath;
+
+    private void Log(string message)
+    {
+        if (!Settings.DebugLog) return;
+        // Lazily resolve the path in case Log is called before Initialise
+        var path = _logFilePath ?? Path.Combine(DirectoryFullName, "HighlightedItems_debug.log");
+        var line = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
+        DebugWindow.LogMsg($"[HI] {message}");
+        try
+        {
+            lock (_logLock)
+            {
+                File.AppendAllText(path, line + Environment.NewLine);
+            }
+        }
+        catch
+        {
+            // Swallow file write errors so they never crash the plugin
+        }
+    }
+
     private record QueryOrException(ItemQuery Query, Exception Exception);
 
     private readonly ConditionalWeakTable<string, QueryOrException> _queries = [];
@@ -45,8 +68,15 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
 
     public override bool Initialise()
     {
-        Graphics.InitImage(Path.Combine(DirectoryFullName, "images\\pick.png").Replace('\\', '/'), false);
-        Graphics.InitImage(Path.Combine(DirectoryFullName, "images\\pickL.png").Replace('\\', '/'), false);
+        _logFilePath = Path.Combine(DirectoryFullName, "HighlightedItems_debug.log");
+        Log($"Initialise — DirectoryFullName={DirectoryFullName}");
+
+        var pickPath = Path.Combine(DirectoryFullName, "images\\pick.png").Replace('\\', '/');
+        var pickLPath = Path.Combine(DirectoryFullName, "images\\pickL.png").Replace('\\', '/');
+        Log($"Loading images: {pickPath}  |  {pickLPath}");
+        Graphics.InitImage(pickPath, false);
+        Graphics.InitImage(pickLPath, false);
+        Log("Initialise complete");
 
         return true;
     }
@@ -272,6 +302,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                     .OrderBy(stashItem => stashItem.GetClientRectCache.X)
                     .ThenBy(stashItem => stashItem.GetClientRectCache.Y)
                     .ToList();
+                Log($"Trigger MoveToInventory — customFilter={isCustomFilter} highlighted={highlightedItems.Count} total={orderedItems.Count} stashRect={stashRect}");
                 _currentOperation = MoveItemsToInventory(orderedItems);
             }
         }
@@ -330,6 +361,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                         .ThenBy(x => x.PosY)
                         .ToList();
 
+                    Log($"Trigger MoveToStash — customFilter={isCustomFilter} items={inventoryItems.Count} inventoryRect={inventoryRect}");
                     _currentOperation = MoveItemsToStash(inventoryItems);
                 }
             }
@@ -347,6 +379,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
 
                 if (IsButtonPressed(sortButtonRect) || Input.IsKeyDown(Settings.SortInventoryHotkey.Value))
                 {
+                    Log($"Trigger SortInventory — inventoryRect={inventoryRect}");
                     _currentOperation = SortInventory(inventoryRect);
                 }
             }
@@ -408,9 +441,11 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
     {
         if (!await MoveItemsCommonPreamble())
         {
+            Log("MoveItemsToStash: preamble returned false (cancelled before start)");
             return false;
         }
 
+        Log($"MoveItemsToStash: starting — {items.Count} items");
         _prevMousePos = Mouse.GetCursorPosition();
         var processedIndices = new HashSet<int>();
         for (var i = 0; i < items.Count; i++)
@@ -419,25 +454,32 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 continue;
 
             var item = items[i];
-            if (MoveCancellationRequested) 
+            if (MoveCancellationRequested)
             {
+                Log($"MoveItemsToStash: cancelled by right-click at item {i}");
                 await StopMovingItems();
                 return false;
             }
 
             if (!InGameState.IngameUi.InventoryPanel.IsVisible)
             {
+                Log("MoveItemsToStash: Inventory Panel closed, aborting loop");
                 DebugWindow.LogMsg("HighlightedItems: Inventory Panel closed, aborting loop");
                 break;
             }
 
             if (!IsStashTargetOpened)
             {
+                Log("MoveItemsToStash: Target inventory closed, aborting loop");
                 DebugWindow.LogMsg("HighlightedItems: Target inventory closed, aborting loop");
                 break;
             }
 
             var isStackable = item.Item?.GetComponent<Stack>() != null;
+            var itemRect = item.GetClientRect();
+            Log($"MoveItemsToStash: [{i}/{items.Count}] path={item.Item?.Path} pos=({item.PosX},{item.PosY}) size=({item.SizeX}x{item.SizeY}) " +
+                $"stackable={isStackable} rect=({itemRect.X:F0},{itemRect.Y:F0},{itemRect.Width:F0}x{itemRect.Height:F0})");
+
             if (isStackable)
             {
                 var itemPath = item.Item?.Path ?? "";
@@ -451,12 +493,13 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
 
             Keyboard.KeyDown(Keys.LControlKey);
             await Wait(KeyDelay, true);
-            await MoveItem(item.GetClientRect().Center, isStackable);
+            await MoveItem(itemRect.Center, isStackable);
             Keyboard.KeyUp(Keys.LControlKey);
             await Wait(KeyDelay, true);
             processedIndices.Add(i);
         }
 
+        Log("MoveItemsToStash: done");
         await StopMovingItems();
         return true;
     }
@@ -480,9 +523,11 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
     {
         if (!await MoveItemsCommonPreamble())
         {
+            Log("MoveItemsToInventory: preamble returned false (cancelled before start)");
             return false;
         }
 
+        Log($"MoveItemsToInventory: starting — {items.Count} items");
         _prevMousePos = Mouse.GetCursorPosition();
         for (var i = 0; i < items.Count; i++)
         {
@@ -490,45 +535,56 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             _itemsToMove = items[i..].Select(x => x.GetClientRectCache).ToList();
             if (MoveCancellationRequested)
             {
+                Log($"MoveItemsToInventory: cancelled by right-click at item {i}");
                 await StopMovingItems();
                 return false;
             }
 
             if (!IsStashSourceOpened)
             {
+                Log("MoveItemsToInventory: Stash Panel closed, aborting loop");
                 DebugWindow.LogMsg("HighlightedItems: Stash Panel closed, aborting loop");
                 break;
             }
 
             if (!InGameState.IngameUi.InventoryPanel.IsVisible)
             {
+                Log("MoveItemsToInventory: Inventory Panel closed, aborting loop");
                 DebugWindow.LogMsg("HighlightedItems: Inventory Panel closed, aborting loop");
                 break;
             }
 
             if (IsInventoryFull())
             {
+                Log("MoveItemsToInventory: Inventory full, aborting loop");
                 DebugWindow.LogMsg("HighlightedItems: Inventory full, aborting loop");
                 break;
             }
 
+            var itemRect = item.GetClientRect();
+            Log($"MoveItemsToInventory: [{i}/{items.Count}] path={item.Item?.Path} " +
+                $"rect=({itemRect.X:F0},{itemRect.Y:F0},{itemRect.Width:F0}x{itemRect.Height:F0})");
+
             Keyboard.KeyDown(Keys.LControlKey);
             await Wait(KeyDelay, true);
-            await MoveItem(item.GetClientRect().Center);
+            await MoveItem(itemRect.Center);
             Keyboard.KeyUp(Keys.LControlKey);
             await Wait(KeyDelay, true);
         }
 
+        Log("MoveItemsToInventory: done");
         await StopMovingItems();
         return true;
     }
 
-    private async SyncTask<bool> StopMovingItems() {
+    private async SyncTask<bool> StopMovingItems()
+    {
         Keyboard.KeyUp(Keys.LControlKey);
         await Wait(KeyDelay, false);
         Mouse.moveMouse(_prevMousePos);
         _prevMousePos = Point.Zero;
         _itemsToMove = null;
+        Log("StopMovingItems");
         DebugWindow.LogMsg("HighlightedItems: Stopped moving items");
         return true;
     }
@@ -596,11 +652,21 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 }
             }
 
-            // no empty slots, so inventory is full
+            // no empty slots; log the full grid for diagnostics
+            var gridLines = new System.Text.StringBuilder();
+            for (int row = 0; row < 5; row++)
+            {
+                var line = new System.Text.StringBuilder("  ");
+                for (int col = 0; col < 12; col++)
+                    line.Append(inventorySlot[col, row] ? "X" : ".");
+                gridLines.AppendLine(line.ToString());
+            }
+            Log($"IsInventoryFull: FULL — item count={inventoryItems.Count}{Environment.NewLine}{gridLines}");
             return true;
         }
         catch (Exception ex)
         {
+            Log($"IsInventoryFull: exception — {ex.Message}");
             DebugWindow.LogError($"HighlightedItems: IsInventoryFull check failed: {ex.Message}");
             return false;
         }
@@ -613,8 +679,10 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
 
     private async SyncTask<bool> MoveItem(SharpDX.Vector2 itemPosition, bool isStackable = false)
     {
-        itemPosition += WindowOffset;
-        Mouse.moveMouse(itemPosition);
+        var offset = WindowOffset;
+        var absolutePos = itemPosition + offset;
+        Log($"MoveItem: pos=({itemPosition.X:F0},{itemPosition.Y:F0}) offset=({offset.X:F0},{offset.Y:F0}) absolute=({absolutePos.X:F0},{absolutePos.Y:F0}) stackable={isStackable}");
+        Mouse.moveMouse(absolutePos);
         await Wait(MouseMoveDelay, true);
         if (isStackable)
         {
@@ -710,7 +778,11 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
 
     private async SyncTask<bool> SortInventory(SharpDX.RectangleF inventoryRect)
     {
-        if (!await MoveItemsCommonPreamble()) return false;
+        if (!await MoveItemsCommonPreamble())
+        {
+            Log("SortInventory: preamble returned false (cancelled before start)");
+            return false;
+        }
         _prevMousePos = Mouse.GetCursorPosition();
 
         // ── PHASE 1: Scan inventory and compute the complete target layout ────────────
@@ -724,18 +796,18 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             .Where(x => !IsInIgnoreCell(x))
             .ToList();
 
-        DebugWindow.LogMsg($"[Sort] Starting sort. Items found (excl. ignored cells): {initialItems.Count}");
+        Log($"SortInventory: starting — inventoryRect={inventoryRect} items={initialItems.Count}");
 
         if (!initialItems.Any())
         {
-            DebugWindow.LogMsg("[Sort] No items to sort. Aborting.");
+            Log("SortInventory: no items to sort. Aborting.");
             await StopMovingItems();
             return true;
         }
 
         // Derive pixel grid geometry once from on-screen item rects.
         var (cellW, cellH, gridOriginX, gridOriginY) = CalibrateGridGeometry(initialItems, inventoryRect);
-        DebugWindow.LogMsg($"[Sort] Grid geometry — cellW={cellW:F1} cellH={cellH:F1} originX={gridOriginX:F1} originY={gridOriginY:F1}");
+        Log($"SortInventory: grid geometry — cellW={cellW:F2} cellH={cellH:F2} originX={gridOriginX:F2} originY={gridOriginY:F2} windowOffset=({WindowOffset.X:F0},{WindowOffset.Y:F0})");
 
         // Sort order: category → area desc → width desc → path → address.
         // Address as final tiebreaker gives a completely stable ordering.
@@ -756,17 +828,17 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             var fit = FindFirstFit(targetGrid, it.SizeX, it.SizeY);
             if (fit == null)
             {
-                DebugWindow.LogMsg($"[Sort] NOFIT — {it.Item.Path} ({it.SizeX}x{it.SizeY}) at ({it.PosX},{it.PosY}) — no slot found, leaving in place");
+                Log($"SortInventory: NOFIT — {it.Item.Path} ({it.SizeX}x{it.SizeY}) at ({it.PosX},{it.PosY}) — no slot found, leaving in place");
                 continue;
             }
             plan[it.Item.Address] = (fit.Value.col, fit.Value.row, it.SizeX, it.SizeY);
-            DebugWindow.LogMsg($"[Sort] Plan: {it.Item.Path} ({it.SizeX}x{it.SizeY}) ({it.PosX},{it.PosY}) → ({fit.Value.col},{fit.Value.row})");
+            Log($"SortInventory: plan — {it.Item.Path} ({it.SizeX}x{it.SizeY}) ({it.PosX},{it.PosY}) → ({fit.Value.col},{fit.Value.row})");
             for (var dy = 0; dy < it.SizeY; dy++)
                 for (var dx = 0; dx < it.SizeX; dx++)
                     targetGrid[fit.Value.col + dx, fit.Value.row + dy] = true;
         }
 
-        DebugWindow.LogMsg($"[Sort] Plan complete: {plan.Count}/{initialItems.Count} items assigned targets");
+        Log($"SortInventory: plan complete — {plan.Count}/{initialItems.Count} items assigned targets");
 
         // ── PHASE 2: Execute the plan move by move ────────────────────────────────────
         // Hard upper bound: 120 moves covers any realistic 12×5 inventory (60 items × 2 moves
@@ -778,13 +850,13 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         {
             if (MoveCancellationRequested)
             {
-                DebugWindow.LogMsg("[Sort] Cancelled by right-click.");
+                Log("SortInventory: cancelled by right-click");
                 await StopMovingItems();
                 return false;
             }
             if (!InGameState.IngameUi.InventoryPanel.IsVisible)
             {
-                DebugWindow.LogMsg("[Sort] Inventory panel no longer visible — stopping.");
+                Log("SortInventory: inventory panel no longer visible — stopping");
                 break;
             }
 
@@ -795,7 +867,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
 
             if (!currentItems.Any())
             {
-                DebugWindow.LogMsg("[Sort] currentItems is empty — stopping.");
+                Log("SortInventory: currentItems is empty — stopping");
                 break;
             }
 
@@ -805,7 +877,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 .All(x => { var t = plan[x.Item.Address]; return x.PosX == t.col && x.PosY == t.row; });
             if (done)
             {
-                DebugWindow.LogMsg($"[Sort] All items at target. Done in {moveCount} moves.");
+                Log($"SortInventory: all items at target — done in {moveCount} moves");
                 break;
             }
 
@@ -829,7 +901,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             // Break the cycle by parking one blocked item in any free area that is NOT its own cell.
             if (itemToMove == null)
             {
-                DebugWindow.LogMsg("[Sort] Deadlock detected — finding park slot");
+                Log("SortInventory: deadlock detected — searching for park slot");
                 foreach (var it in currentItems)
                 {
                     if (it.Item == null || !plan.TryGetValue(it.Item.Address, out var target)) continue;
@@ -843,11 +915,11 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                     var parkSlot = FindFirstFitNotAt(tempGrid, it.SizeX, it.SizeY, it.PosX, it.PosY);
                     if (parkSlot == null)
                     {
-                        DebugWindow.LogMsg($"[Sort] No park slot for {it.Item.Path} ({it.SizeX}x{it.SizeY}) at ({it.PosX},{it.PosY})");
+                        Log($"SortInventory: no park slot for {it.Item.Path} ({it.SizeX}x{it.SizeY}) at ({it.PosX},{it.PosY})");
                         continue;
                     }
 
-                    DebugWindow.LogMsg($"[Sort] Parking {it.Item.Path} ({it.SizeX}x{it.SizeY}) from ({it.PosX},{it.PosY}) → park ({parkSlot.Value.col},{parkSlot.Value.row})");
+                    Log($"SortInventory: parking {it.Item.Path} ({it.SizeX}x{it.SizeY}) from ({it.PosX},{it.PosY}) → park ({parkSlot.Value.col},{parkSlot.Value.row})");
                     itemToMove = it;
                     destCol = parkSlot.Value.col;
                     destRow = parkSlot.Value.row;
@@ -857,7 +929,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
 
             if (itemToMove == null)
             {
-                DebugWindow.LogMsg("[Sort] No moveable item found (deadlock unresolvable). Stopping.");
+                Log("SortInventory: no moveable item found (deadlock unresolvable) — stopping");
                 break;
             }
 
@@ -880,10 +952,13 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 gridOriginX + (destCol + itemToMove.SizeX / 2 + 0.5f) * cellW,
                 gridOriginY + (destRow + itemToMove.SizeY / 2 + 0.5f) * cellH);
 
-            DebugWindow.LogMsg($"[Sort] Move #{moveCount + 1}: {itemToMove.Item?.Path} ({itemToMove.SizeX}x{itemToMove.SizeY}) " +
-                               $"grid ({itemToMove.PosX},{itemToMove.PosY}) → ({destCol},{destRow}) | " +
-                               $"itemRect=({itemRect.X:F0},{itemRect.Y:F0},{itemRect.Width:F0}x{itemRect.Height:F0}) " +
-                               $"src=({srcCenter.X:F0},{srcCenter.Y:F0}) dst=({dstCenter.X:F0},{dstCenter.Y:F0})");
+            Log($"SortInventory: move #{moveCount + 1} — {itemToMove.Item?.Path} ({itemToMove.SizeX}x{itemToMove.SizeY}) " +
+                $"grid ({itemToMove.PosX},{itemToMove.PosY}) → ({destCol},{destRow}) | " +
+                $"itemRect=({itemRect.X:F0},{itemRect.Y:F0},{itemRect.Width:F0}x{itemRect.Height:F0}) " +
+                $"srcCellWH=({srcCellW:F2},{srcCellH:F2}) " +
+                $"src=({srcCenter.X:F0},{srcCenter.Y:F0}) dst=({dstCenter.X:F0},{dstCenter.Y:F0}) " +
+                $"src+offset=({srcCenter.X + WindowOffset.X:F0},{srcCenter.Y + WindowOffset.Y:F0}) " +
+                $"dst+offset=({dstCenter.X + WindowOffset.X:F0},{dstCenter.Y + WindowOffset.Y:F0})");
 
             // Pick up (left-click on source).
             Mouse.moveMouse(srcCenter + WindowOffset);
@@ -905,9 +980,9 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         }
 
         if (moveCount >= MaxMoves)
-            DebugWindow.LogMsg($"[Sort] Reached move limit ({MaxMoves}). Stopping.");
+            Log($"SortInventory: reached move limit ({MaxMoves}) — stopping");
 
-        DebugWindow.LogMsg($"[Sort] Finished. Total moves: {moveCount}");
+        Log($"SortInventory: finished — total moves={moveCount}");
         await StopMovingItems();
         return true;
     }

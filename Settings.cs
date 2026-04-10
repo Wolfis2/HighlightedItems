@@ -63,6 +63,9 @@ public class Settings : ISettings
     [ConditionalDisplay(nameof(UseCustomMoveToInventoryButtonPosition))]
     public RangeNode<Vector2> CustomMoveToInventoryButtonPosition { get; set; } = new(Vector2.Zero, Vector2.Zero, Vector2.One * 6000);
 
+    [Menu("Enable Debug Log", "Write detailed debug output to HighlightedItems_debug.log in the plugin folder")]
+    public ToggleNode DebugLog { get; set; } = new(false);
+
     [IgnoreMenu]
     public List<string> SavedFilters { get; set; } = [];
 

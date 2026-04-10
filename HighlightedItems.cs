@@ -713,8 +713,49 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         if (!await MoveItemsCommonPreamble()) return false;
         _prevMousePos = Mouse.GetCursorPosition();
 
+        // ── PHASE 1: Scan inventory and compute the complete target layout ────────────
+        // Read the inventory once, assign every item a fixed target slot using column-first
+        // First-Fit Decreasing bin-packing, and store the plan keyed by item address.
+        // Computing the plan upfront (rather than re-computing on every iteration) ensures
+        // target assignments never change mid-sort, preventing the algorithm from chasing
+        // a moving goal and placing items on top of each other.
+
+        var initialItems = GameController.IngameState.ServerData.PlayerInventories[0].Inventory.InventorySlotItems
+            .Where(x => !IsInIgnoreCell(x))
+            .ToList();
+
+        if (!initialItems.Any()) { await StopMovingItems(); return true; }
+
+        // Derive pixel grid geometry once from on-screen item rects.
+        var (cellW, cellH, gridOriginX, gridOriginY) = CalibrateGridGeometry(initialItems, inventoryRect);
+
+        // Sort order: category → area desc → width desc → path → address.
+        // Address as final tiebreaker gives a completely stable ordering.
+        var packingOrder = initialItems
+            .OrderBy(GetItemCategory)
+            .ThenByDescending(x => x.SizeX * x.SizeY)
+            .ThenByDescending(x => x.SizeX)
+            .ThenBy(x => x.Item?.Path ?? "")
+            .ThenBy(x => x.Item?.Address ?? 0)
+            .ToList();
+
+        // Assign target slots and record them in plan[itemAddress] = (col, row, sizeX, sizeY).
+        var targetGrid = BuildIgnoredCellsGrid();
+        var plan = new Dictionary<long, (int col, int row, int sizeX, int sizeY)>();
+        foreach (var it in packingOrder)
+        {
+            if (it.Item == null) continue;
+            var fit = FindFirstFit(targetGrid, it.SizeX, it.SizeY);
+            if (fit == null) continue; // no room; leave this item in place
+            plan[it.Item.Address] = (fit.Value.col, fit.Value.row, it.SizeX, it.SizeY);
+            for (var dy = 0; dy < it.SizeY; dy++)
+                for (var dx = 0; dx < it.SizeX; dx++)
+                    targetGrid[fit.Value.col + dx, fit.Value.row + dy] = true;
+        }
+
+        // ── PHASE 2: Execute the plan move by move ────────────────────────────────────
         // Hard upper bound: 120 moves covers any realistic 12×5 inventory (60 items × 2 moves
-        // in the absolute worst case where every item must be parked before reaching its target).
+        // in the absolute worst case where every item must be parked before its target is free).
         const int MaxMoves = 120;
         var moveCount = 0;
 
@@ -723,78 +764,43 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             if (MoveCancellationRequested) { await StopMovingItems(); return false; }
             if (!InGameState.IngameUi.InventoryPanel.IsVisible) break;
 
-            // Re-read current layout every iteration for an accurate view of the grid.
+            // Re-read current positions every iteration so we always have an accurate view.
             var currentItems = GameController.IngameState.ServerData.PlayerInventories[0].Inventory.InventorySlotItems
                 .Where(x => !IsInIgnoreCell(x))
                 .ToList();
 
             if (!currentItems.Any()) break;
 
-            // Derive the pixel grid geometry from the items' own on-screen rects.
-            // Averaging across all items eliminates any panel-padding error that would arise
-            // from naively dividing the outer panel rect by 12×5.
-            var (cellW, cellH, gridOriginX, gridOriginY) = CalibrateGridGeometry(currentItems, inventoryRect);
-
-            // Build the desired layout using category-grouped First-Fit Decreasing.
-            // The sort key is fully deterministic (category -> area desc -> width desc -> path ->
-            // current position), so every item is assigned the same target slot on every
-            // iteration, giving a stable, predictable end-state.
-            var packingOrder = currentItems
-                .OrderBy(GetItemCategory)
-                .ThenByDescending(x => x.SizeX * x.SizeY)
-                .ThenByDescending(x => x.SizeX)
-                .ThenBy(x => x.Item?.Path ?? "")
-                .ThenBy(x => x.Item?.Address ?? 0)
-                .ToList();
-
-            var targetGrid = BuildIgnoredCellsGrid();
-            var targetCols = new int[packingOrder.Count];
-            var targetRows = new int[packingOrder.Count];
-            for (var i = 0; i < packingOrder.Count; i++)
-            {
-                var it = packingOrder[i];
-                var fit = FindFirstFit(targetGrid, it.SizeX, it.SizeY);
-                if (fit == null) { targetCols[i] = -1; targetRows[i] = -1; continue; }
-                targetCols[i] = fit.Value.col;
-                targetRows[i] = fit.Value.row;
-                for (var dy = 0; dy < it.SizeY; dy++)
-                    for (var dx = 0; dx < it.SizeX; dx++)
-                        targetGrid[targetCols[i] + dx, targetRows[i] + dy] = true;
-            }
-
-            // Convergence check: if every item is already at its target, we are done.
-            var done = true;
-            for (var i = 0; i < packingOrder.Count; i++)
-            {
-                if (targetCols[i] < 0) continue;
-                if (packingOrder[i].PosX != targetCols[i] || packingOrder[i].PosY != targetRows[i])
-                { done = false; break; }
-            }
+            // Convergence check: every planned item is already at its target.
+            var done = currentItems
+                .Where(x => x.Item != null && plan.ContainsKey(x.Item.Address))
+                .All(x => { var t = plan[x.Item.Address]; return x.PosX == t.col && x.PosY == t.row; });
             if (done) break;
 
-            // Find a "safe" move: an item whose entire target area is currently free.
+            // Find a "safe" move: item not at its target AND the target area is currently free.
             var occupancy = BuildOccupancyGrid(currentItems);
-            var moveIdx = -1;
-            var destCol = 0; var destRow = 0;
-            for (var i = 0; i < packingOrder.Count && moveIdx < 0; i++)
+            ServerInventory.InventSlotItem itemToMove = null;
+            int destCol = 0, destRow = 0;
+            foreach (var it in currentItems)
             {
-                if (targetCols[i] < 0) continue;
-                var it = packingOrder[i];
-                var tc = targetCols[i]; var tr = targetRows[i];
-                if (it.PosX == tc && it.PosY == tr) continue;
-                if (IsTargetAreaFree(occupancy, tc, tr, it.SizeX, it.SizeY, it.PosX, it.PosY, it.SizeX, it.SizeY))
-                { moveIdx = i; destCol = tc; destRow = tr; }
+                if (it.Item == null || !plan.TryGetValue(it.Item.Address, out var target)) continue;
+                if (it.PosX == target.col && it.PosY == target.row) continue;
+                if (!IsTargetAreaFree(occupancy, target.col, target.row, it.SizeX, it.SizeY,
+                        it.PosX, it.PosY, it.SizeX, it.SizeY)) continue;
+                itemToMove = it;
+                destCol = target.col;
+                destRow = target.row;
+                break;
             }
 
             // Deadlock: every pending item's target is blocked by another item.
-            // Break the cycle by parking one item in any free area that is NOT its own current cell.
-            if (moveIdx < 0)
+            // Break the cycle by parking one blocked item in any free area that is NOT its own cell.
+            if (itemToMove == null)
             {
-                for (var i = 0; i < packingOrder.Count && moveIdx < 0; i++)
+                foreach (var it in currentItems)
                 {
-                    if (targetCols[i] < 0) continue;
-                    var it = packingOrder[i];
-                    if (it.PosX == targetCols[i] && it.PosY == targetRows[i]) continue;
+                    if (it.Item == null || !plan.TryGetValue(it.Item.Address, out var target)) continue;
+                    if (it.PosX == target.col && it.PosY == target.row) continue;
 
                     var tempGrid = BuildOccupancyGrid(currentItems);
                     for (var dy = 0; dy < it.SizeY; dy++)
@@ -804,40 +810,35 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                     var parkSlot = FindFirstFitNotAt(tempGrid, it.SizeX, it.SizeY, it.PosX, it.PosY);
                     if (parkSlot == null) continue;
 
-                    moveIdx = i;
+                    itemToMove = it;
                     destCol = parkSlot.Value.col;
                     destRow = parkSlot.Value.row;
+                    break;
                 }
             }
 
-            if (moveIdx < 0) break;
+            if (itemToMove == null) break;
 
-            var itemToMove = packingOrder[moveIdx];
-
-            // Source: click the centre of the item's own top-left cell.
-            // Using GetClientRect() directly gives the exact on-screen position; we compute
-            // the per-cell size from the item's own rect to guarantee accuracy regardless of
-            // item dimensions. This avoids coordinate drift that accumulates when deriving
-            // cell size from the outer panel rect (which may include padding/borders).
+            // Source: click the centre of the item's anchor cell.
+            // PoE attaches the held item to the cursor at the clicked cell (the "anchor").
+            // We use floor(SizeX/2), floor(SizeY/2) as the anchor — the same cell used for
+            // the destination click — so pickup and placement are fully consistent.
+            // Example: 2×3 item → anchor at (1,1); click centre of that cell both to grab
+            // and to place, so the item's top-left always lands exactly at the target slot.
             var itemRect = itemToMove.GetClientRect();
             var srcCellW = itemToMove.SizeX > 0 ? itemRect.Width / itemToMove.SizeX : cellW;
             var srcCellH = itemToMove.SizeY > 0 ? itemRect.Height / itemToMove.SizeY : cellH;
             var srcCenter = new SharpDX.Vector2(
-                itemRect.X + srcCellW * 0.5f,
-                itemRect.Y + srcCellH * 0.5f);
+                itemRect.X + (itemToMove.SizeX / 2 + 0.5f) * srcCellW,
+                itemRect.Y + (itemToMove.SizeY / 2 + 0.5f) * srcCellH);
 
-            // Destination: click at the CENTER of PoE's anchor cell for this item.
-            // PoE's anchor = floor(SizeX/2) columns and floor(SizeY/2) rows from the item's
-            // top-left corner (integer division).  We must click at the CENTER of that cell
-            // (add 0.5) so we reliably land inside it, not on a cell boundary.
-            // Example: 2×4 item → anchor cell is (1,2) from TL; click at col (destCol+1+0.5)
-            //          and row (destRow+2+0.5).  Using float division (/ 2.0f) would give
-            //          1.0 / 2.0 instead of 1.5 / 2.5 for even sizes, landing on the boundary.
+            // Destination: click the centre of the anchor cell at the target position.
+            // Integer division gives floor(SizeX/2); +0.5f centres within that cell.
             var dstCenter = new SharpDX.Vector2(
                 gridOriginX + (destCol + itemToMove.SizeX / 2 + 0.5f) * cellW,
                 gridOriginY + (destRow + itemToMove.SizeY / 2 + 0.5f) * cellH);
 
-            // Pick up (left-click on source; no modifier = plain grab).
+            // Pick up (left-click on source).
             Mouse.moveMouse(srcCenter + WindowOffset);
             await Wait(MouseMoveDelay, true);
             Mouse.LeftDown();
@@ -845,7 +846,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             Mouse.LeftUp();
             await Wait(KeyDelay, true);
 
-            // Place (left-click on destination; item's top-left aligns with clicked cell).
+            // Place (left-click on destination).
             Mouse.moveMouse(dstCenter + WindowOffset);
             await Wait(MouseMoveDelay, true);
             Mouse.LeftDown();

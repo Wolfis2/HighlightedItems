@@ -49,4 +49,14 @@ internal class Mouse
     {
         mouse_event((int)MouseEvents.LeftUp, 0, 0, 0, 0);
     }
+
+    public static void RightDown()
+    {
+        mouse_event((int)MouseEvents.RightDown, 0, 0, 0, 0);
+    }
+
+    public static void RightUp()
+    {
+        mouse_event((int)MouseEvents.RightUp, 0, 0, 0, 0);
+    }
 }

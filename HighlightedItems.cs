@@ -713,6 +713,9 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         if (!await MoveItemsCommonPreamble()) return false;
         _prevMousePos = Mouse.GetCursorPosition();
 
+        // Up to 4 passes: in the worst case (all items need to move) the First-Fit Decreasing
+        // algorithm may need to swap items through intermediate positions. 4 passes is sufficient
+        // to converge for any realistic 12×5 inventory layout.
         const int MaxPasses = 4;
         for (var pass = 0; pass < MaxPasses; pass++)
         {

@@ -966,24 +966,32 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                     if (it.PosX == target.col && it.PosY == target.row) continue;
 
                     var tempGrid = BuildOccupancyGrid(currentItems);
+
+                    // Mark ignored cells as off-limits so items are never parked there.
+                    // Items in ignored cells are excluded from currentItems and therefore
+                    // invisible to BuildOccupancyGrid; without this step the park algorithm
+                    // would treat those cells as free and park items into them, where the
+                    // convergence check cannot see them.
+                    for (var r = 0; r < 5; r++)
+                        for (var c = 0; c < 12; c++)
+                            if (Settings.IgnoredCells[r, c]) tempGrid[c, r] = true;
+
                     for (var dy = 0; dy < it.SizeY; dy++)
                         for (var dx = 0; dx < it.SizeX; dx++)
                             tempGrid[it.PosX + dx, it.PosY + dy] = false;
 
-                    // Mark the final target areas of all OTHER pending items as off-limits.
-                    // Without this, the park slot could overlap a sibling item's destination,
-                    // causing PoE to perform an unwanted implicit swap on the next placement
-                    // and leaving that sibling item stranded on the cursor.
-                    foreach (var other in currentItems)
+                    // Mark ALL plan target areas as off-limits (both pending and already-settled).
+                    // Iterating plan.Values directly (rather than filtering currentItems) protects
+                    // at-target items even when a server-data timing gap temporarily hides them
+                    // from currentItems, preventing an unwanted implicit swap that would displace
+                    // a settled item and leave it stranded on the cursor.
+                    foreach (var (tCol, tRow, tSizeX, tSizeY) in plan.Values)
                     {
-                        if (other == it || other.Item == null) continue;
-                        if (!plan.TryGetValue(other.Item.Address, out var otherTarget)) continue;
-                        if (other.PosX == otherTarget.col && other.PosY == otherTarget.row) continue;
-                        for (var dy2 = 0; dy2 < other.SizeY; dy2++)
-                            for (var dx2 = 0; dx2 < other.SizeX; dx2++)
+                        for (var dy2 = 0; dy2 < tSizeY; dy2++)
+                            for (var dx2 = 0; dx2 < tSizeX; dx2++)
                             {
-                                var tc = otherTarget.col + dx2;
-                                var tr = otherTarget.row + dy2;
+                                var tc = tCol + dx2;
+                                var tr = tRow + dy2;
                                 if (tc >= 0 && tc < 12 && tr >= 0 && tr < 5)
                                     tempGrid[tc, tr] = true;
                             }

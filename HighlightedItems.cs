@@ -744,8 +744,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 .ThenByDescending(x => x.SizeX * x.SizeY)
                 .ThenByDescending(x => x.SizeX)
                 .ThenBy(x => x.Item?.Path ?? "")
-                .ThenBy(x => x.PosX)
-                .ThenBy(x => x.PosY)
+                .ThenBy(x => x.Item?.Address ?? 0)
                 .ToList();
 
             var targetGrid = BuildIgnoredCellsGrid();
@@ -827,10 +826,13 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 itemRect.X + srcCellW * 0.5f,
                 itemRect.Y + srcCellH * 0.5f);
 
-            // Destination: centre of the top-left target cell in the calibrated grid.
+            // Destination: click at the item's CENTER over the target slot.
+            // In PoE, a held item is always centered on the cursor, so to land the item's
+            // top-left corner at (destCol, destRow) we must click at the midpoint of the
+            // item's full footprint: (destCol + SizeX/2, destRow + SizeY/2).
             var dstCenter = new SharpDX.Vector2(
-                gridOriginX + (destCol + 0.5f) * cellW,
-                gridOriginY + (destRow + 0.5f) * cellH);
+                gridOriginX + (destCol + itemToMove.SizeX / 2.0f) * cellW,
+                gridOriginY + (destRow + itemToMove.SizeY / 2.0f) * cellH);
 
             // Pick up (left-click on source; no modifier = plain grab).
             Mouse.moveMouse(srcCenter + WindowOffset);

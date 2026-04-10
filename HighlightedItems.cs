@@ -896,9 +896,16 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 {
                     if (newItem.Item.Address != pendingOldAddress && plan.ContainsKey(pendingOldAddress))
                     {
-                        Log($"SortInventory: re-keyed plan entry 0x{pendingOldAddress:X} → 0x{newItem.Item.Address:X} at ({pendingDestCol},{pendingDestRow})");
-                        plan[newItem.Item.Address] = plan[pendingOldAddress];
-                        plan.Remove(pendingOldAddress);
+                        var pendingEntry = plan[pendingOldAddress];
+                        // Verify dimensions match to guard against re-keying to the wrong item
+                        // if PoE performed an implicit swap and the destination transiently holds
+                        // a different item.
+                        if (newItem.SizeX == pendingEntry.sizeX && newItem.SizeY == pendingEntry.sizeY)
+                        {
+                            Log($"SortInventory: re-keyed plan entry 0x{pendingOldAddress:X} → 0x{newItem.Item.Address:X} at ({pendingDestCol},{pendingDestRow})");
+                            plan[newItem.Item.Address] = pendingEntry;
+                            plan.Remove(pendingOldAddress);
+                        }
                     }
                     pendingOldAddress = 0; // confirmed — item found at destination
                 }

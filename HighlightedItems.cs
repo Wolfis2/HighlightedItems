@@ -426,7 +426,6 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                         processedIndices.Add(j);
                 }
             }
-            processedIndices.Add(i);
             _itemsToMove = items.Where((_, idx) => !processedIndices.Contains(idx)).Select(x => x.GetClientRect()).ToList();
 
             Keyboard.KeyDown(Keys.LControlKey);
@@ -434,6 +433,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             await MoveItem(item.GetClientRect().Center, isStackable);
             Keyboard.KeyUp(Keys.LControlKey);
             await Wait(KeyDelay, true);
+            processedIndices.Add(i);
         }
 
         await StopMovingItems();
@@ -504,7 +504,6 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                         processedIndices.Add(j);
                 }
             }
-            processedIndices.Add(i);
             _itemsToMove = items.Where((_, idx) => !processedIndices.Contains(idx)).Select(x => x.GetClientRectCache).ToList();
 
             Keyboard.KeyDown(Keys.LControlKey);
@@ -512,6 +511,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             await MoveItem(item.GetClientRect().Center, isStackable);
             Keyboard.KeyUp(Keys.LControlKey);
             await Wait(KeyDelay, true);
+            processedIndices.Add(i);
         }
 
         await StopMovingItems();
@@ -603,11 +603,9 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         await Wait(MouseMoveDelay, true);
         if (isStackable)
         {
-            uint x = (uint)itemPosition.X;
-            uint y = (uint)itemPosition.Y;
-            mouse_event(MOUSEEVENTF_RIGHTDOWN, x, y, 0, IntPtr.Zero);
+            mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, IntPtr.Zero);
             await Wait(MouseDownDelay, true);
-            mouse_event(MOUSEEVENTF_RIGHTUP, x, y, 0, IntPtr.Zero);
+            mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, IntPtr.Zero);
         }
         else
         {

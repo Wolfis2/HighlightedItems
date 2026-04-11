@@ -305,6 +305,26 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 Log($"Trigger MoveToInventory — customFilter={isCustomFilter} highlighted={highlightedItems.Count} total={orderedItems.Count} stashRect={stashRect}");
                 _currentOperation = MoveItemsToInventory(orderedItems);
             }
+
+            if (Settings.SortStashButtonEnable)
+            {
+                // Sort button: to the right of the stash dump icon
+                var sortStashPos = Settings.UseCustomMoveToInventoryButtonPosition
+                    ? Settings.CustomMoveToInventoryButtonPosition + new Vector2(buttonSize + 4, 0)
+                    : stashRect.BottomRight.ToVector2Num() + new Vector2(-43 + buttonSize + 4, 10);
+                var sortStashRect = new SharpDX.RectangleF(sortStashPos.X, sortStashPos.Y, buttonSize, buttonSize);
+
+                Graphics.DrawFrame(sortStashRect.TopLeft.ToVector2Num(), sortStashRect.BottomRight.ToVector2Num(), SharpDX.Color.White, 2);
+                var slp = new Vector2(sortStashRect.Center.X, sortStashRect.Center.Y - 10);
+                Graphics.DrawText("Sort", slp with { X = slp.X + 1 }, SharpDX.Color.Black, FontAlign.Center);
+                Graphics.DrawText("Sort", slp, SharpDX.Color.White, FontAlign.Center);
+
+                if (IsButtonPressed(sortStashRect) || Input.IsKeyDown(Settings.SortStashHotkey.Value))
+                {
+                    Log($"Trigger SortStash — stashRect={stashRect}");
+                    _currentOperation = SortStash(stashRect);
+                }
+            }
         }
         else
         {
@@ -1356,5 +1376,492 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             }
         }
         return null;
+    }
+
+    // ── Stash sort helpers ────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Calibrates the stash grid's per-cell pixel dimensions and top-left origin by
+    /// averaging values implied by each item's screen rect and logical size.
+    /// Because <see cref="NormalInventoryItem.InventPosX"/> / <see cref="NormalInventoryItem.InventPosY"/>
+    /// are obsolete and return 0 in current ExileCore builds, grid positions are bootstrapped
+    /// by rounding each item's screen-rect offset against the panel rect, then refining the
+    /// origin once cellW/cellH are known.
+    /// </summary>
+    private static (float cellW, float cellH, float originX, float originY, int cols, int rows)
+        CalibrateStashGrid(IEnumerable<NormalInventoryItem> items, SharpDX.RectangleF panelRect)
+    {
+        var itemList = items.Where(x => x.ItemWidth > 0 && x.ItemHeight > 0).ToList();
+        if (!itemList.Any())
+            return (panelRect.Width / 12f, panelRect.Height / 12f, panelRect.X, panelRect.Y, 12, 12);
+
+        // Step 1: estimate cell size from item screen rects and item sizes.
+        double sumW = 0, sumH = 0;
+        var n = 0;
+        foreach (var item in itemList)
+        {
+            var r = item.GetClientRectCache;
+            if (r.Width <= 0 || r.Height <= 0) continue;
+            sumW += r.Width / (double)item.ItemWidth;
+            sumH += r.Height / (double)item.ItemHeight;
+            n++;
+        }
+        if (n == 0)
+            return (panelRect.Width / 12f, panelRect.Height / 12f, panelRect.X, panelRect.Y, 12, 12);
+
+        var cellW = (float)(sumW / n);
+        var cellH = (float)(sumH / n);
+
+        // Step 2: for each item estimate its grid position (using the panel's left/top edge as
+        // a first approximation of the origin), then compute the precise origin.
+        double sumOX = 0, sumOY = 0;
+        var maxCol = 0;
+        var maxRow = 0;
+        foreach (var item in itemList)
+        {
+            var r = item.GetClientRectCache;
+            var estPosX = (int)Math.Round((r.X - panelRect.X) / cellW);
+            var estPosY = (int)Math.Round((r.Y - panelRect.Y) / cellH);
+            sumOX += r.X - estPosX * cellW;
+            sumOY += r.Y - estPosY * cellH;
+            maxCol = Math.Max(maxCol, estPosX + item.ItemWidth);
+            maxRow = Math.Max(maxRow, estPosY + item.ItemHeight);
+        }
+
+        return (cellW, cellH,
+                (float)(sumOX / itemList.Count),
+                (float)(sumOY / itemList.Count),
+                Math.Max(maxCol, 12),
+                Math.Max(maxRow, 12));
+    }
+
+    /// <summary>
+    /// Like <see cref="FindFirstFit"/> but works on an arbitrarily-sized grid.
+    /// Scans column-first (left-to-right outer, top-to-bottom inner) for consistent
+    /// left-side-first bin-packing, matching the inventory sort order.
+    /// </summary>
+    private static (int col, int row)? FindFirstFitInGrid(bool[,] grid, int maxCols, int maxRows, int w, int h)
+    {
+        for (var col = 0; col <= maxCols - w; col++)
+            for (var row = 0; row <= maxRows - h; row++)
+            {
+                var fits = true;
+                for (var dr = 0; dr < h && fits; dr++)
+                    for (var dc = 0; dc < w && fits; dc++)
+                        if (grid[col + dc, row + dr]) fits = false;
+                if (fits) return (col, row);
+            }
+        return null;
+    }
+
+    /// <summary>
+    /// Like <see cref="IsTargetAreaFree"/> but works on an arbitrarily-sized grid.
+    /// Pass srcSizeX = srcSizeY = 0 when there is no source footprint to exclude.
+    /// </summary>
+    private static bool IsTargetAreaFreeInGrid(
+        bool[,] occupancy, int maxCols, int maxRows,
+        int targetCol, int targetRow, int sizeX, int sizeY,
+        int srcCol, int srcRow, int srcSizeX, int srcSizeY)
+    {
+        if (targetCol < 0 || targetRow < 0 || targetCol + sizeX > maxCols || targetRow + sizeY > maxRows)
+            return false;
+        for (var dy = 0; dy < sizeY; dy++)
+            for (var dx = 0; dx < sizeX; dx++)
+            {
+                var c = targetCol + dx;
+                var r = targetRow + dy;
+                if (!occupancy[c, r]) continue;
+                if (srcSizeX > 0 && srcSizeY > 0 &&
+                    c >= srcCol && c < srcCol + srcSizeX &&
+                    r >= srcRow && r < srcRow + srcSizeY)
+                    continue; // within source footprint — will be vacated
+                return false;
+            }
+        return true;
+    }
+
+    // ── SortStash ─────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Sorts the currently-visible stash tab using the same column-first, area-ascending
+    /// bin-packing order as <see cref="SortInventory"/>.  Because stash tabs are typically
+    /// full, the player inventory is used as a staging area: when all remaining stash items
+    /// are deadlocked (every target is occupied by another item that also needs to move),
+    /// one item is Ctrl+Clicked to the inventory to free its stash cell, enabling other
+    /// direct stash→stash moves, after which the staged item is returned to its target.
+    /// This cycle repeats until all items are at their sorted positions.
+    /// </summary>
+    private async SyncTask<bool> SortStash(SharpDX.RectangleF stashPanelRect)
+    {
+        if (!await MoveItemsCommonPreamble())
+        {
+            Log("SortStash: preamble returned false");
+            return false;
+        }
+        _prevMousePos = Mouse.GetCursorPosition();
+
+        if (!InGameState.IngameUi.InventoryPanel.IsVisible)
+        {
+            Log("SortStash: inventory panel must be open (needed as staging area) — aborting");
+            DebugWindow.LogMsg("HighlightedItems: Open your inventory before sorting the stash.");
+            await StopMovingItems();
+            return false;
+        }
+
+        // ── PHASE 1: Read stash and build sort plan ───────────────────────────────────
+        var stashEl = (InGameState.IngameUi.StashElement, InGameState.IngameUi.GuildStashElement) switch
+        {
+            ({ IsVisible: true, VisibleStash: { } vs }, _) => vs,
+            (_, { IsVisible: true, VisibleStash: { } vs }) => vs,
+            _ => null
+        };
+        if (stashEl == null)
+        {
+            Log("SortStash: no visible stash — aborting");
+            await StopMovingItems();
+            return false;
+        }
+
+        var initialItems = stashEl.VisibleInventoryItems
+            .Where(x => x?.Item != null && x.ItemWidth > 0 && x.ItemHeight > 0)
+            .ToList();
+
+        Log($"SortStash: starting — {initialItems.Count} items, panelRect={stashPanelRect}");
+        if (!initialItems.Any())
+        {
+            Log("SortStash: stash is empty — nothing to sort");
+            await StopMovingItems();
+            return true;
+        }
+
+        // Calibrate stash grid geometry from visible items' screen rects.
+        var (cellW, cellH, originX, originY, stashCols, stashRows) =
+            CalibrateStashGrid(initialItems, stashPanelRect);
+        Log($"SortStash: grid {stashCols}×{stashRows}, cellW={cellW:F2} cellH={cellH:F2} origin=({originX:F2},{originY:F2})");
+
+        // Local helper: derive grid position for a NormalInventoryItem from its screen rect.
+        (int posX, int posY) GridPos(NormalInventoryItem item)
+        {
+            var r = item.GetClientRectCache;
+            return ((int)Math.Round((r.X - originX) / cellW),
+                    (int)Math.Round((r.Y - originY) / cellH));
+        }
+
+        // Build sort plan: same ordering as SortInventory (area asc → narrower first → category → path → address).
+        var packingOrder = initialItems
+            .OrderBy(x => x.ItemWidth * x.ItemHeight)
+            .ThenBy(x => x.ItemWidth)
+            .ThenBy(x => x.Item?.Path?.Split('/') is { Length: > 2 } seg ? seg[2] : "Misc")
+            .ThenBy(x => x.Item?.Path ?? "")
+            .ThenBy(x => x.Item?.Address ?? 0L)
+            .ToList();
+
+        var targetGrid = new bool[stashCols, stashRows];
+        // plan[currentAddress] = (targetCol, targetRow, sizeX, sizeY)
+        var plan = new Dictionary<long, (int col, int row, int sizeX, int sizeY)>();
+        foreach (var it in packingOrder)
+        {
+            if (it.Item == null) continue;
+            var fit = FindFirstFitInGrid(targetGrid, stashCols, stashRows, it.ItemWidth, it.ItemHeight);
+            if (fit == null)
+            {
+                Log($"SortStash: NOFIT — {it.Item.Path} ({it.ItemWidth}×{it.ItemHeight})");
+                continue;
+            }
+            var (px, py) = GridPos(it);
+            plan[it.Item.Address] = (fit.Value.col, fit.Value.row, it.ItemWidth, it.ItemHeight);
+            Log($"SortStash: plan — {it.Item.Path} ({it.ItemWidth}×{it.ItemHeight}) ({px},{py}) → ({fit.Value.col},{fit.Value.row})");
+            for (var dy = 0; dy < it.ItemHeight; dy++)
+                for (var dx = 0; dx < it.ItemWidth; dx++)
+                    targetGrid[fit.Value.col + dx, fit.Value.row + dy] = true;
+        }
+        Log($"SortStash: plan complete — {plan.Count}/{initialItems.Count} items assigned targets");
+
+        // ── PHASE 2: Execute plan ─────────────────────────────────────────────────────
+        // stagingSet: addresses of plan items currently in the player inventory (not in stash).
+        var stagingSet = new HashSet<long>();
+
+        // Pending-move tracking: mirrors the scheme used in SortInventory.
+        long pendingOldAddress = 0;
+        int pendingDestCol = -1, pendingDestRow = -1;
+        bool pendingIsStashToInventory = false; // true when a Ctrl+Click staging move is pending
+        HashSet<long> preStageInvAddresses = null; // inventory snapshot taken before staging ctrl+click
+        int pendingRetryCount = 0;
+
+        var maxMoves = stashCols * stashRows * 3 + 60;
+        var moveCount = 0;
+
+        while (moveCount < maxMoves)
+        {
+            if (MoveCancellationRequested)
+            {
+                Log("SortStash: cancelled by right-click");
+                await StopMovingItems();
+                return false;
+            }
+
+            var loopStashEl = (InGameState.IngameUi.StashElement, InGameState.IngameUi.GuildStashElement) switch
+            {
+                ({ IsVisible: true, VisibleStash: { } vs }, _) => vs,
+                (_, { IsVisible: true, VisibleStash: { } vs }) => vs,
+                _ => null
+            };
+            if (loopStashEl == null)
+            {
+                Log("SortStash: stash panel closed — stopping");
+                break;
+            }
+            if (!InGameState.IngameUi.InventoryPanel.IsVisible)
+            {
+                Log("SortStash: inventory panel closed — stopping");
+                break;
+            }
+
+            var currentStashItems = loopStashEl.VisibleInventoryItems
+                .Where(x => x?.Item != null && x.ItemWidth > 0 && x.ItemHeight > 0)
+                .ToList();
+            var rawInvItems = GameController.IngameState.ServerData.PlayerInventories[0].Inventory.InventorySlotItems;
+            var currentInvItems = rawInvItems.Where(x => !IsInIgnoreCell(x)).ToList();
+
+            // ── Plan re-keying (PoE reassigns Item.Address on each slot placement) ──────
+            if (pendingOldAddress != 0)
+            {
+                var rekeyed = false;
+
+                if (pendingIsStashToInventory)
+                {
+                    // Stash→inventory (Ctrl+Click): find the new inventory item that appeared.
+                    if (plan.TryGetValue(pendingOldAddress, out var pendingEntry))
+                    {
+                        var newInvItem = rawInvItems.FirstOrDefault(x =>
+                            x.Item != null &&
+                            !plan.ContainsKey(x.Item.Address) &&
+                            preStageInvAddresses != null &&
+                            !preStageInvAddresses.Contains(x.Item.Address) &&
+                            x.SizeX == pendingEntry.sizeX &&
+                            x.SizeY == pendingEntry.sizeY);
+                        if (newInvItem != null)
+                        {
+                            Log($"SortStash: staged 0x{pendingOldAddress:X} → inv 0x{newInvItem.Item.Address:X}");
+                            plan[newInvItem.Item.Address] = pendingEntry;
+                            plan.Remove(pendingOldAddress);
+                            stagingSet.Add(newInvItem.Item.Address);
+                            pendingOldAddress = 0;
+                            pendingRetryCount = 0;
+                            rekeyed = true;
+                        }
+                    }
+                    else
+                    {
+                        // Entry already re-keyed by a previous iteration.
+                        pendingOldAddress = 0;
+                        rekeyed = true;
+                    }
+                }
+                else
+                {
+                    // Stash→stash or inventory→stash: find item at target stash position.
+                    var newStashItem = currentStashItems.FirstOrDefault(x =>
+                    {
+                        var (px, py) = GridPos(x);
+                        return px == pendingDestCol && py == pendingDestRow;
+                    });
+                    if (newStashItem != null)
+                    {
+                        if (newStashItem.Item.Address != pendingOldAddress && plan.ContainsKey(pendingOldAddress))
+                        {
+                            var e = plan[pendingOldAddress];
+                            if (newStashItem.ItemWidth == e.sizeX && newStashItem.ItemHeight == e.sizeY)
+                            {
+                                Log($"SortStash: re-keyed 0x{pendingOldAddress:X} → 0x{newStashItem.Item.Address:X} at ({pendingDestCol},{pendingDestRow})");
+                                plan[newStashItem.Item.Address] = e;
+                                plan.Remove(pendingOldAddress);
+                                stagingSet.Remove(pendingOldAddress); // no-op for stash→stash; removes for inv→stash
+                            }
+                        }
+                        pendingOldAddress = 0;
+                        pendingRetryCount = 0;
+                        rekeyed = true;
+                    }
+                }
+
+                if (!rekeyed)
+                {
+                    if (++pendingRetryCount > 10)
+                    {
+                        Log($"SortStash: server confirmation timeout after {pendingRetryCount} retries — stopping");
+                        break;
+                    }
+                    await Wait(KeyDelay, true);
+                    continue;
+                }
+            }
+            pendingRetryCount = 0;
+
+            // ── Convergence check ─────────────────────────────────────────────────────
+            if (stagingSet.Count == 0 && plan.All(kv =>
+            {
+                var item = currentStashItems.FirstOrDefault(x => x.Item?.Address == kv.Key);
+                if (item == null) return false;
+                var (px, py) = GridPos(item);
+                return px == kv.Value.col && py == kv.Value.row;
+            }))
+            {
+                Log($"SortStash: all items at target — done in {moveCount} moves");
+                break;
+            }
+
+            // Build stash and inventory occupancy grids.
+            var stashOcc = new bool[stashCols, stashRows];
+            foreach (var it in currentStashItems)
+            {
+                var (px, py) = GridPos(it);
+                for (var dy = 0; dy < it.ItemHeight; dy++)
+                    for (var dx = 0; dx < it.ItemWidth; dx++)
+                    {
+                        var c = px + dx; var r = py + dy;
+                        if (c >= 0 && c < stashCols && r >= 0 && r < stashRows)
+                            stashOcc[c, r] = true;
+                    }
+            }
+            var invOcc = BuildOccupancyGrid(currentInvItems);
+
+            var moved = false;
+
+            // ── Priority 1: Return staged inventory items to their stash targets ──────
+            foreach (var addr in stagingSet.ToList())
+            {
+                if (!plan.TryGetValue(addr, out var target)) continue;
+                var invItem = rawInvItems.FirstOrDefault(x => x.Item?.Address == addr);
+                if (invItem == null) continue;
+
+                if (!IsTargetAreaFreeInGrid(stashOcc, stashCols, stashRows,
+                        target.col, target.row, target.sizeX, target.sizeY, -1, -1, 0, 0))
+                    continue;
+
+                var invR = invItem.GetClientRect();
+                var iCW = invItem.SizeX > 0 ? invR.Width / invItem.SizeX : invR.Width;
+                var iCH = invItem.SizeY > 0 ? invR.Height / invItem.SizeY : invR.Height;
+                var srcCenter = new SharpDX.Vector2(
+                    invR.X + (invItem.SizeX / 2 + 0.5f) * iCW,
+                    invR.Y + (invItem.SizeY / 2 + 0.5f) * iCH);
+                var dstCenter = new SharpDX.Vector2(
+                    originX + (target.col + target.sizeX / 2 + 0.5f) * cellW,
+                    originY + (target.row + target.sizeY / 2 + 0.5f) * cellH);
+
+                Log($"SortStash: move #{moveCount + 1} [inv→stash] {invItem.Item?.Path} ({target.sizeX}×{target.sizeY}) → stash({target.col},{target.row})");
+                Mouse.moveMouse(srcCenter + WindowOffset);
+                await Wait(MouseMoveDelay, true);
+                Mouse.LeftDown(); await Wait(MouseDownDelay, true); Mouse.LeftUp();
+                await Wait(KeyDelay, true);
+                Mouse.moveMouse(dstCenter + WindowOffset);
+                await Wait(MouseMoveDelay, true);
+                Mouse.LeftDown(); await Wait(MouseDownDelay, true); Mouse.LeftUp();
+                await Wait(KeyDelay, true);
+
+                pendingOldAddress = addr;
+                pendingDestCol = target.col;
+                pendingDestRow = target.row;
+                pendingIsStashToInventory = false;
+                pendingRetryCount = 0;
+                moveCount++;
+                moved = true;
+                break;
+            }
+            if (moved) continue;
+
+            // ── Priority 2: Direct stash→stash moves (target area is free) ───────────
+            foreach (var it in currentStashItems)
+            {
+                if (it.Item == null || !plan.TryGetValue(it.Item.Address, out var target)) continue;
+                var (px, py) = GridPos(it);
+                if (px == target.col && py == target.row) continue; // already at target
+                if (!IsTargetAreaFreeInGrid(stashOcc, stashCols, stashRows,
+                        target.col, target.row, target.sizeX, target.sizeY,
+                        px, py, it.ItemWidth, it.ItemHeight))
+                    continue;
+
+                var ir = it.GetClientRectCache;
+                var sCW = it.ItemWidth > 0 ? ir.Width / it.ItemWidth : cellW;
+                var sCH = it.ItemHeight > 0 ? ir.Height / it.ItemHeight : cellH;
+                var srcCenter = new SharpDX.Vector2(
+                    ir.X + (it.ItemWidth / 2 + 0.5f) * sCW,
+                    ir.Y + (it.ItemHeight / 2 + 0.5f) * sCH);
+                var dstCenter = new SharpDX.Vector2(
+                    originX + (target.col + target.sizeX / 2 + 0.5f) * cellW,
+                    originY + (target.row + target.sizeY / 2 + 0.5f) * cellH);
+
+                Log($"SortStash: move #{moveCount + 1} [stash→stash] {it.Item?.Path} ({it.ItemWidth}×{it.ItemHeight}) ({px},{py})→({target.col},{target.row})");
+                Mouse.moveMouse(srcCenter + WindowOffset);
+                await Wait(MouseMoveDelay, true);
+                Mouse.LeftDown(); await Wait(MouseDownDelay, true); Mouse.LeftUp();
+                await Wait(KeyDelay, true);
+                Mouse.moveMouse(dstCenter + WindowOffset);
+                await Wait(MouseMoveDelay, true);
+                Mouse.LeftDown(); await Wait(MouseDownDelay, true); Mouse.LeftUp();
+                await Wait(KeyDelay, true);
+
+                pendingOldAddress = it.Item.Address;
+                pendingDestCol = target.col;
+                pendingDestRow = target.row;
+                pendingIsStashToInventory = false;
+                pendingRetryCount = 0;
+                moveCount++;
+                moved = true;
+                break;
+            }
+            if (moved) continue;
+
+            // ── Priority 3: Stage one stash item to inventory to break the deadlock ───
+            NormalInventoryItem toStage = null;
+            foreach (var it in currentStashItems)
+            {
+                if (it.Item == null || !plan.TryGetValue(it.Item.Address, out var target)) continue;
+                var (px, py) = GridPos(it);
+                if (px == target.col && py == target.row) continue; // already at target
+                // Only stage if inventory has space for this item's footprint.
+                if (FindFirstFit(invOcc, it.ItemWidth, it.ItemHeight) == null) continue;
+                toStage = it;
+                break;
+            }
+            if (toStage == null)
+            {
+                Log("SortStash: deadlock — no item can be staged (inventory full or no unsettled items)");
+                break;
+            }
+
+            // Snapshot inventory addresses before the Ctrl+Click so we can identify the new item.
+            preStageInvAddresses = new HashSet<long>(
+                rawInvItems.Where(x => x.Item != null).Select(x => x.Item.Address));
+
+            var sr = toStage.GetClientRectCache;
+            var ssCW = toStage.ItemWidth > 0 ? sr.Width / toStage.ItemWidth : cellW;
+            var ssCH = toStage.ItemHeight > 0 ? sr.Height / toStage.ItemHeight : cellH;
+            var stageCenter = new SharpDX.Vector2(
+                sr.X + (toStage.ItemWidth / 2 + 0.5f) * ssCW,
+                sr.Y + (toStage.ItemHeight / 2 + 0.5f) * ssCH);
+            var (spx, spy) = GridPos(toStage);
+            Log($"SortStash: staging {toStage.Item?.Path} ({toStage.ItemWidth}×{toStage.ItemHeight}) from stash({spx},{spy}) to inventory");
+
+            Keyboard.KeyDown(Keys.LControlKey);
+            await Wait(KeyDelay, true);
+            Mouse.moveMouse(stageCenter + WindowOffset);
+            await Wait(MouseMoveDelay, true);
+            Mouse.LeftDown(); await Wait(MouseDownDelay, true); Mouse.LeftUp();
+            Keyboard.KeyUp(Keys.LControlKey);
+            await Wait(KeyDelay, true);
+
+            pendingOldAddress = toStage.Item.Address;
+            pendingIsStashToInventory = true;
+            pendingRetryCount = 0;
+            moveCount++;
+        }
+
+        if (moveCount >= maxMoves)
+            Log($"SortStash: reached move limit ({maxMoves}) — stopping");
+
+        Log($"SortStash: finished — total moves={moveCount}");
+        await StopMovingItems();
+        return true;
     }
 }

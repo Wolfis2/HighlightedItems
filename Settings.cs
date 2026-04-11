@@ -21,6 +21,9 @@ public class Settings : ISettings
     [Menu("Enable Inventory Sort Button")]
     public ToggleNode SortButtonEnable { get; set; } = new(true);
 
+    [Menu("Enable Stash Sort Button")]
+    public ToggleNode SortStashButtonEnable { get; set; } = new(true);
+
     public ToggleNode ShowStackSizes { get; set; } = new(true);
 
     [Menu("Show Stack Count Next to Stack Size")]
@@ -30,6 +33,7 @@ public class Settings : ISettings
     public ToggleNode UseMoveToInventoryAsMoveToStashWhenNoHighlights { get; set; } = new(false);
     public HotkeyNode MoveToStashHotkey { get; set; } = new(Keys.None);
     public HotkeyNode SortInventoryHotkey { get; set; } = new(Keys.None);
+    public HotkeyNode SortStashHotkey { get; set; } = new(Keys.None);
     public ToggleNode InvertSelection { get; set; } = new(false);
     public ToggleNode ShowCustomFilterWindow { get; set; } = new(true);
     public ToggleNode ResetCustomFilterOnPanelClose { get; set; } = new(true);

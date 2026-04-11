@@ -958,17 +958,21 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                         (x.PosX < 0 || x.PosX >= 12 || x.PosY < 0 || x.PosY >= 5)).ToList();
                     foreach (var cursorItem in cursorItems)
                     {
-                        var matchKey = staleKeys
-                            .Cast<long?>()
-                            .FirstOrDefault(k =>
-                                plan[k!.Value].sizeX == cursorItem.SizeX &&
-                                plan[k.Value].sizeY == cursorItem.SizeY);
-                        if (matchKey.HasValue)
+                        long matchKey = 0;
+                        foreach (var k in staleKeys)
                         {
-                            Log($"SortInventory: re-keyed displaced cursor item 0x{matchKey.Value:X} → 0x{cursorItem.Item.Address:X}");
-                            plan[cursorItem.Item.Address] = plan[matchKey.Value];
-                            plan.Remove(matchKey.Value);
-                            staleKeys.Remove(matchKey.Value);
+                            if (plan[k].sizeX == cursorItem.SizeX && plan[k].sizeY == cursorItem.SizeY)
+                            {
+                                matchKey = k;
+                                break;
+                            }
+                        }
+                        if (matchKey != 0)
+                        {
+                            Log($"SortInventory: re-keyed displaced cursor item 0x{matchKey:X} → 0x{cursorItem.Item.Address:X}");
+                            plan[cursorItem.Item.Address] = plan[matchKey];
+                            plan.Remove(matchKey);
+                            staleKeys.Remove(matchKey);
                         }
                     }
                 }

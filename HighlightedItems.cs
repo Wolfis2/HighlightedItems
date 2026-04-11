@@ -1691,7 +1691,9 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
 
                 if (!rekeyed)
                 {
-                    if (++pendingRetryCount > 10)
+                    // Stash UI updates after a server round-trip (not in the same frame as the click).
+                    // At low frame rates (~12 fps) each retry is ~80 ms; allow up to ~8 s of waiting.
+                    if (++pendingRetryCount > 100)
                     {
                         Log($"SortStash: server confirmation timeout after {pendingRetryCount} retries — stopping");
                         break;

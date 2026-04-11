@@ -1588,6 +1588,10 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         HashSet<long> preStageInvAddresses = null; // inventory snapshot taken before staging ctrl+click
         int pendingRetryCount = 0;
 
+        // Upper bound: each of the N stash cells can require at most 2 moves in a sort (one
+        // staging move stash→inventory and one return move inventory→stash), plus a direct
+        // stash→stash placement, giving 3 moves per cell.  The +60 covers the extra round-trip
+        // moves for inventory staging items (up to one full inventory worth of items in flight).
         var maxMoves = stashCols * stashRows * 3 + 60;
         var moveCount = 0;
 

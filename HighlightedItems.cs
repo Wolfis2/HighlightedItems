@@ -28,8 +28,42 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
     [DllImport("user32.dll", SetLastError = true)]
     private static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, IntPtr dwExtraInfo);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool BlockInput(bool fBlockIt);
+
     private const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
     private const uint MOUSEEVENTF_RIGHTUP = 0x0010;
+
+    private bool _inputBlocked = false;
+
+    private void LockInput()
+    {
+        if (!Settings.LockInputDuringSort) return;
+        try
+        {
+            if (BlockInput(true))
+            {
+                _inputBlocked = true;
+                Log("LockInput: input locked");
+            }
+            else
+            {
+                Log("LockInput: BlockInput returned false (may require administrator privileges)");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"LockInput: exception — {ex.Message}");
+        }
+    }
+
+    private void UnlockInput()
+    {
+        if (!_inputBlocked) return;
+        try { BlockInput(false); } catch { }
+        _inputBlocked = false;
+        Log("UnlockInput: input unlocked");
+    }
 
     private SyncTask<bool> _currentOperation;
     private string _customStashFilter = "";
@@ -308,10 +342,10 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
 
             if (Settings.SortStashButtonEnable)
             {
-                // Sort button: to the right of the stash dump icon
+                // Sort button: to the left of the stash dump icon
                 var sortStashPos = Settings.UseCustomMoveToInventoryButtonPosition
-                    ? Settings.CustomMoveToInventoryButtonPosition + new Vector2(buttonSize + 4, 0)
-                    : stashRect.BottomRight.ToVector2Num() + new Vector2(-43 + buttonSize + 4, 10);
+                    ? Settings.CustomMoveToInventoryButtonPosition + new Vector2(-(buttonSize + 4), 0)
+                    : stashRect.BottomRight.ToVector2Num() + new Vector2(-43 - buttonSize - 4, 10);
                 var sortStashRect = new SharpDX.RectangleF(sortStashPos.X, sortStashPos.Y, buttonSize, buttonSize);
 
                 Graphics.DrawFrame(sortStashRect.TopLeft.ToVector2Num(), sortStashRect.BottomRight.ToVector2Num(), SharpDX.Color.White, 2);
@@ -599,6 +633,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
 
     private async SyncTask<bool> StopMovingItems()
     {
+        UnlockInput();
         Keyboard.KeyUp(Keys.LControlKey);
         await Wait(KeyDelay, false);
         Mouse.moveMouse(_prevMousePos);
@@ -804,6 +839,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             return false;
         }
         _prevMousePos = Mouse.GetCursorPosition();
+        LockInput();
 
         // ── PHASE 1: Scan inventory and compute the complete target layout ────────────
         // Read the inventory once, assign every item a fixed target slot using column-first
@@ -1499,6 +1535,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             return false;
         }
         _prevMousePos = Mouse.GetCursorPosition();
+        LockInput();
 
         if (!InGameState.IngameUi.InventoryPanel.IsVisible)
         {
@@ -1867,6 +1904,92 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             Log($"SortStash: reached move limit ({maxMoves}) — stopping");
 
         Log($"SortStash: finished — total moves={moveCount}");
+
+        // ── Phase 3: Cleanup — return any remaining staged items back to stash ─────────
+        // After the main sort loop (whether it completed normally or was cut short by a
+        // timeout / deadlock), some items may still be sitting in the player's inventory
+        // staging area.  Attempt a Ctrl+Click back to stash for each one; skip any item
+        // whose footprint no longer fits (stash is still full for that size).
+        if (stagingSet.Count > 0)
+        {
+            Log($"SortStash: cleanup — {stagingSet.Count} staged item(s) still in inventory, attempting return to stash");
+            foreach (var addr in stagingSet.ToList())
+            {
+                if (MoveCancellationRequested) break;
+
+                var cleanupStashEl = (InGameState.IngameUi.StashElement, InGameState.IngameUi.GuildStashElement) switch
+                {
+                    ({ IsVisible: true, VisibleStash: { } vs }, _) => vs,
+                    (_, { IsVisible: true, VisibleStash: { } vs }) => vs,
+                    _ => null
+                };
+                if (cleanupStashEl == null || !InGameState.IngameUi.InventoryPanel.IsVisible) break;
+
+                var cleanupRawInv = GameController.IngameState.ServerData.PlayerInventories[0].Inventory.InventorySlotItems;
+                var invItem = cleanupRawInv.FirstOrDefault(x => x.Item?.Address == addr);
+                if (invItem == null) { stagingSet.Remove(addr); continue; } // already gone
+
+                // Check if stash has room for this item's footprint.
+                var cleanupStashItems = cleanupStashEl.VisibleInventoryItems
+                    .Where(x => x?.Item != null && x.ItemWidth > 0 && x.ItemHeight > 0).ToList();
+                var cleanupStashOcc = new bool[stashCols, stashRows];
+                foreach (var si in cleanupStashItems)
+                {
+                    var (spx, spy) = GridPos(si);
+                    for (var dy = 0; dy < si.ItemHeight; dy++)
+                        for (var dx = 0; dx < si.ItemWidth; dx++)
+                        {
+                            var c = spx + dx; var r = spy + dy;
+                            if (c >= 0 && c < stashCols && r >= 0 && r < stashRows)
+                                cleanupStashOcc[c, r] = true;
+                        }
+                }
+                if (FindFirstFitInGrid(cleanupStashOcc, stashCols, stashRows, invItem.SizeX, invItem.SizeY) == null)
+                {
+                    Log($"SortStash: cleanup — no room in stash for {invItem.Item?.Path} ({invItem.SizeX}×{invItem.SizeY}) — leaving in inventory");
+                    continue;
+                }
+
+                var ir = invItem.GetClientRect();
+                var iCW = invItem.SizeX > 0 ? ir.Width / invItem.SizeX : ir.Width;
+                var iCH = invItem.SizeY > 0 ? ir.Height / invItem.SizeY : ir.Height;
+                var ctrPos = new SharpDX.Vector2(
+                    ir.X + (invItem.SizeX / 2 + 0.5f) * iCW,
+                    ir.Y + (invItem.SizeY / 2 + 0.5f) * iCH);
+                Log($"SortStash: cleanup — ctrl+click {invItem.Item?.Path} ({invItem.SizeX}×{invItem.SizeY}) back to stash");
+
+                Keyboard.KeyDown(Keys.LControlKey);
+                await Wait(KeyDelay, true);
+                Mouse.moveMouse(ctrPos + WindowOffset);
+                await Wait(MouseMoveDelay, true);
+                Mouse.LeftDown(); await Wait(MouseDownDelay, true); Mouse.LeftUp();
+                Keyboard.KeyUp(Keys.LControlKey);
+                await Wait(KeyDelay, true);
+
+                // Poll until the item disappears from inventory (server confirmation).
+                var confirmed = false;
+                for (var retry = 0; retry < 50; retry++)
+                {
+                    var freshInv = GameController.IngameState.ServerData.PlayerInventories[0].Inventory.InventorySlotItems;
+                    if (!freshInv.Any(x => x.Item?.Address == addr))
+                    {
+                        stagingSet.Remove(addr);
+                        Log($"SortStash: cleanup — {invItem.Item?.Path} returned to stash successfully");
+                        confirmed = true;
+                        break;
+                    }
+                    await Wait(KeyDelay, true);
+                }
+                if (!confirmed)
+                    Log($"SortStash: cleanup — timeout waiting for {invItem.Item?.Path} to leave inventory");
+            }
+
+            if (stagingSet.Count > 0)
+                Log($"SortStash: cleanup complete — {stagingSet.Count} item(s) could not be returned to stash (stash full)");
+            else
+                Log("SortStash: cleanup complete — all staged items returned to stash");
+        }
+
         await StopMovingItems();
         return true;
     }

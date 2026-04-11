@@ -75,15 +75,13 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
     private void Log(string message)
     {
         if (!Settings.DebugLog) return;
-        // Lazily resolve the path in case Log is called before Initialise
-        var path = _logFilePath ?? Path.Combine(DirectoryFullName, "HighlightedItems_debug.log");
         var line = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
         DebugWindow.LogMsg($"[HI] {message}");
         try
         {
             lock (_logLock)
             {
-                File.AppendAllText(path, line + Environment.NewLine);
+                File.AppendAllText(_logFilePath, line + Environment.NewLine);
             }
         }
         catch
@@ -105,11 +103,8 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         _logFilePath = Path.Combine(DirectoryFullName, "HighlightedItems_debug.log");
         Log($"Initialise — DirectoryFullName={DirectoryFullName}");
 
-        var pickPath = Path.Combine(DirectoryFullName, "images\\pick.png").Replace('\\', '/');
-        var pickLPath = Path.Combine(DirectoryFullName, "images\\pickL.png").Replace('\\', '/');
-        Log($"Loading images: {pickPath}  |  {pickLPath}");
-        Graphics.InitImage(pickPath, false);
-        Graphics.InitImage(pickLPath, false);
+        foreach (var img in new[] { "pick.png", "pickL.png", "sort.png" })
+            Graphics.InitImage(Path.Combine(DirectoryFullName, "images", img).Replace('\\', '/'), false);
         Log("Initialise complete");
 
         return true;
@@ -322,8 +317,8 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 : $"{highlightedItems.Count}";
 
             var countPos = new Vector2(buttonRect.Left - 2, buttonRect.Center.Y - 11);
-            Graphics.DrawText($"{countText}", countPos with { Y = countPos.Y + 2 }, SharpDX.Color.Black, FontAlign.Right);
-            Graphics.DrawText($"{countText}", countPos with { X = countPos.X - 2 }, SharpDX.Color.White, FontAlign.Right);
+            Graphics.DrawText(countText, countPos with { Y = countPos.Y + 2 }, SharpDX.Color.Black, FontAlign.Right);
+            Graphics.DrawText(countText, countPos with { X = countPos.X - 2 }, SharpDX.Color.White, FontAlign.Right);
 
             if (IsButtonPressed(buttonRect) ||
                 Input.IsKeyDown(Settings.MoveToInventoryHotkey.Value))
@@ -348,10 +343,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                     : stashRect.BottomRight.ToVector2Num() + new Vector2(-43 - buttonSize - 4, 10);
                 var sortStashRect = new SharpDX.RectangleF(sortStashPos.X, sortStashPos.Y, buttonSize, buttonSize);
 
-                Graphics.DrawFrame(sortStashRect.TopLeft.ToVector2Num(), sortStashRect.BottomRight.ToVector2Num(), SharpDX.Color.White, 2);
-                var slp = new Vector2(sortStashRect.Center.X, sortStashRect.Center.Y - 10);
-                Graphics.DrawText("Sort", slp with { X = slp.X + 1 }, SharpDX.Color.Black, FontAlign.Center);
-                Graphics.DrawText("Sort", slp, SharpDX.Color.White, FontAlign.Center);
+                Graphics.DrawImage("sort.png", sortStashRect);
 
                 if (IsButtonPressed(sortStashRect) || Input.IsKeyDown(Settings.SortStashHotkey.Value))
                 {
@@ -426,10 +418,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 var sortButtonPos = inventoryRect.TopLeft.ToVector2Num() + new Vector2(buttonSize / 2 + buttonSize + 4, -buttonSize);
                 var sortButtonRect = new SharpDX.RectangleF(sortButtonPos.X, sortButtonPos.Y, buttonSize, buttonSize);
 
-                Graphics.DrawFrame(sortButtonRect.TopLeft.ToVector2Num(), sortButtonRect.BottomRight.ToVector2Num(), SharpDX.Color.White, 2);
-                var sortLabelPos = new Vector2(sortButtonRect.Center.X, sortButtonRect.Center.Y - 10);
-                Graphics.DrawText("Sort", sortLabelPos with { X = sortLabelPos.X + 1 }, SharpDX.Color.Black, FontAlign.Center);
-                Graphics.DrawText("Sort", sortLabelPos, SharpDX.Color.White, FontAlign.Center);
+                Graphics.DrawImage("sort.png", sortButtonRect);
 
                 if (IsButtonPressed(sortButtonRect) || Input.IsKeyDown(Settings.SortInventoryHotkey.Value))
                 {

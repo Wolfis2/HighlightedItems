@@ -809,14 +809,17 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         var (cellW, cellH, gridOriginX, gridOriginY) = CalibrateGridGeometry(initialItems, inventoryRect);
         Log($"SortInventory: grid geometry — cellW={cellW:F2} cellH={cellH:F2} originX={gridOriginX:F2} originY={gridOriginY:F2} windowOffset=({WindowOffset.X:F0},{WindowOffset.Y:F0})");
 
-        // Sort order: category → area asc → width asc → path → address.
-        // Ascending size causes smaller (1×1) items to be packed into the leftmost columns first,
-        // so the left side of the inventory favours compact items and large items land on the right.
+        // Sort order: area asc → width asc → category → path → address.
+        // Using area as the PRIMARY key packs the smallest items (1×1 rings/jewels) into the
+        // leftmost columns first, so the left side of the inventory always favours compact items
+        // and large items (2×2 armours, 2×3 quivers) land on the right side.
+        // Within the same area, narrower items pack more tightly (e.g. a 1×2 before a 2×1).
+        // Category as tertiary key keeps items of the same type clustered within each size band.
         // Address as final tiebreaker gives a completely stable ordering.
         var packingOrder = initialItems
-            .OrderBy(GetItemCategory)
-            .ThenBy(x => x.SizeX * x.SizeY)
-            .ThenBy(x => x.SizeX)
+            .OrderBy(x => x.SizeX * x.SizeY)   // PRIMARY: area ascending (1×1 items pack to left)
+            .ThenBy(x => x.SizeX)               // secondary: narrower items first within same area
+            .ThenBy(GetItemCategory)            // tertiary: group same-size items by category
             .ThenBy(x => x.Item?.Path ?? "")
             .ThenBy(x => x.Item?.Address ?? 0)
             .ToList();
@@ -854,6 +857,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         // server reflects the placement at the start of the next loop iteration.
         long pendingOldAddress = 0;
         int pendingDestCol = -1, pendingDestRow = -1;
+        int pendingRetryCount = 0; // guard against stale-server infinite wait
 
         while (moveCount < MaxMoves)
         {
@@ -910,22 +914,76 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                         }
                     }
                     pendingOldAddress = 0; // confirmed — item found at destination
+                    pendingRetryCount = 0;
                 }
                 // If the item is not yet visible at the destination (server still catching up),
                 // keep pendingOldAddress set so we retry the re-key next iteration.
             }
 
+            // ── Stale-data guard ────────────────────────────────────────────────────────────────
+            // If the server has not yet confirmed the last placement, the occupancy grid built
+            // below would be stale.  Acting on stale data can cause a move to land on a slot that
+            // is still logically occupied, triggering a PoE implicit swap that displaces the
+            // existing item to the cursor with a fresh address unknown to the plan — making it
+            // permanently invisible to all subsequent move and convergence checks.
+            // Waiting here (instead of proceeding) ensures occupancy is always up-to-date.
+            if (pendingOldAddress != 0)
+            {
+                if (++pendingRetryCount > 10)
+                {
+                    Log($"SortInventory: server did not confirm last placement after {pendingRetryCount} retries — stopping");
+                    break;
+                }
+                await Wait(KeyDelay, true);
+                continue;
+            }
+            pendingRetryCount = 0;
+
+            // ── Secondary re-key: displaced cursor items ───────────────────────────────────────
+            // If a PoE implicit swap did somehow occur (e.g. network hiccup), the displaced item
+            // lands on the cursor with a new address not present in the plan, while the original
+            // plan entry becomes stale (its address is no longer in the inventory).  Detect this
+            // by finding plan keys absent from the live inventory, then match them by item size to
+            // any cursor-held item not already tracked.  This rescues the item so the sort can
+            // continue rather than silently stalling.
+            {
+                var liveAddresses = new HashSet<long>(
+                    rawInventoryItems.Where(x => x.Item != null).Select(x => x.Item.Address));
+                var staleKeys = plan.Keys.Where(k => !liveAddresses.Contains(k)).ToList();
+                if (staleKeys.Count > 0)
+                {
+                    var cursorItems = rawInventoryItems.Where(x =>
+                        x.Item != null &&
+                        !plan.ContainsKey(x.Item.Address) &&
+                        (x.PosX < 0 || x.PosX >= 12 || x.PosY < 0 || x.PosY >= 5)).ToList();
+                    foreach (var cursorItem in cursorItems)
+                    {
+                        var matchKey = staleKeys
+                            .Cast<long?>()
+                            .FirstOrDefault(k =>
+                                plan[k!.Value].sizeX == cursorItem.SizeX &&
+                                plan[k.Value].sizeY == cursorItem.SizeY);
+                        if (matchKey.HasValue)
+                        {
+                            Log($"SortInventory: re-keyed displaced cursor item 0x{matchKey.Value:X} → 0x{cursorItem.Item.Address:X}");
+                            plan[cursorItem.Item.Address] = plan[matchKey.Value];
+                            plan.Remove(matchKey.Value);
+                            staleKeys.Remove(matchKey.Value);
+                        }
+                    }
+                }
+            }
+
             // Convergence check: every plan entry must have its item (by address) sitting at the
             // plan target position.  Using plan.All(...) rather than a filtered Where(...).All(...)
-            // prevents vacuous-true exits when parked items have stale plan keys or when a re-key
-            // is still in flight.  We also gate on pendingOldAddress == 0 so the check never fires
-            // while we are still waiting for the server to confirm the last placement.
-            var done = pendingOldAddress == 0
-                && plan.All(kv => rawInventoryItems.Any(x =>
-                    x.Item != null
-                    && x.Item.Address == kv.Key
-                    && x.PosX == kv.Value.col
-                    && x.PosY == kv.Value.row));
+            // prevents vacuous-true exits when parked items have stale plan keys.
+            // pendingOldAddress is always 0 here because the stale-data guard above would have
+            // continued the loop without reaching this point if it were non-zero.
+            var done = plan.All(kv => rawInventoryItems.Any(x =>
+                x.Item != null
+                && x.Item.Address == kv.Key
+                && x.PosX == kv.Value.col
+                && x.PosY == kv.Value.row));
             if (done)
             {
                 Log($"SortInventory: all items at target — done in {moveCount} moves");
@@ -984,6 +1042,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                     pendingOldAddress = heldItem.Item.Address;
                     pendingDestCol = hCol;
                     pendingDestRow = hRow;
+                    pendingRetryCount = 0; // fresh retry budget for this placement
                     moveCount++;
                     continue;
                 }
@@ -1104,6 +1163,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             pendingOldAddress = itemToMove.Item.Address;
             pendingDestCol = destCol;
             pendingDestRow = destRow;
+            pendingRetryCount = 0; // fresh retry budget for this placement
 
             moveCount++;
         }

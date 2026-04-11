@@ -1091,14 +1091,41 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                         for (var dx = 0; dx < it.SizeX; dx++)
                             tempGrid[it.PosX + dx, it.PosY + dy] = false;
 
-                    // Note: we do NOT additionally mark plan target cells as off-limits here.
-                    // Previously all plan targets were blocked, which caused complete deadlock
-                    // when the inventory is nearly full and every free cell happens to be a
-                    // plan target.  Settled items (already at their plan targets) are already
-                    // protected by BuildOccupancyGrid above; free plan-target cells must remain
-                    // available as temporary park slots or the sort cannot make progress.
+                    // Prefer a park slot that doesn't overlap any PENDING plan target (a target
+                    // whose owner hasn't reached it yet).  Parking on a pending target causes a
+                    // cascading chain: the target's owner later bumps into the parked item and
+                    // PoE performs an implicit swap that discards the displaced item's plan key,
+                    // making it invisible to all subsequent moves.
+                    // Build a mask of pending target cells, overlay it on tempGrid, and try to
+                    // find a "clean" slot first.  If no clean slot exists (inventory nearly full),
+                    // fall back to any free slot so the sort never hard-deadlocks.
+                    var pendingTargetGrid = new bool[12, 5];
+                    foreach (var kv in plan)
+                    {
+                        // Skip items already at their target — those cells are occupied in
+                        // tempGrid anyway, so they're already blocked by BuildOccupancyGrid.
+                        if (currentItems.Any(ci =>
+                                ci.Item?.Address == kv.Key &&
+                                ci.PosX == kv.Value.col &&
+                                ci.PosY == kv.Value.row))
+                            continue;
+                        for (var dy2 = 0; dy2 < kv.Value.sizeY; dy2++)
+                            for (var dx2 = 0; dx2 < kv.Value.sizeX; dx2++)
+                            {
+                                var tc = kv.Value.col + dx2;
+                                var tr = kv.Value.row + dy2;
+                                if (tc >= 0 && tc < 12 && tr >= 0 && tr < 5)
+                                    pendingTargetGrid[tc, tr] = true;
+                            }
+                    }
+                    var tempGridNonTarget = (bool[,])tempGrid.Clone();
+                    for (var tr2 = 0; tr2 < 5; tr2++)
+                        for (var tc2 = 0; tc2 < 12; tc2++)
+                            if (pendingTargetGrid[tc2, tr2]) tempGridNonTarget[tc2, tr2] = true;
 
-                    var parkSlot = FindFirstFitNotAt(tempGrid, it.SizeX, it.SizeY, it.PosX, it.PosY);
+                    // Try a slot that avoids pending plan targets; fall back to any free slot.
+                    var parkSlot = FindFirstFitNotAt(tempGridNonTarget, it.SizeX, it.SizeY, it.PosX, it.PosY)
+                                   ?? FindFirstFitNotAt(tempGrid, it.SizeX, it.SizeY, it.PosX, it.PosY);
                     if (parkSlot == null)
                     {
                         Log($"SortInventory: no park slot for {it.Item.Path} ({it.SizeX}x{it.SizeY}) at ({it.PosX},{it.PosY})");

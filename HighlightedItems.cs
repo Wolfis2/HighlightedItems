@@ -285,7 +285,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             //Determine Stash Pickup Button position and draw
             var buttonPos = Settings.UseCustomMoveToInventoryButtonPosition
                 ? Settings.CustomMoveToInventoryButtonPosition
-                : stashRect.BottomRight.ToVector2Num() + new Vector2(-43, 30);
+                : stashRect.BottomRight.ToVector2Num() + new Vector2(-43, 50);
             var buttonRect = new SharpDX.RectangleF(buttonPos.X, buttonPos.Y, buttonSize, buttonSize);
 
             Graphics.DrawImage("pick.png", buttonRect);
@@ -340,7 +340,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 // Sort button: to the left of the stash dump icon
                 var sortStashPos = Settings.UseCustomMoveToInventoryButtonPosition
                     ? Settings.CustomMoveToInventoryButtonPosition + new Vector2(-(buttonSize + 4), 0)
-                    : stashRect.BottomRight.ToVector2Num() + new Vector2(-43 - buttonSize - 4, 30);
+                    : stashRect.BottomRight.ToVector2Num() + new Vector2(-43 - buttonSize - 4, 50);
                 var sortStashRect = new SharpDX.RectangleF(sortStashPos.X, sortStashPos.Y, buttonSize, buttonSize);
 
                 Graphics.DrawImage("sort.png", sortStashRect);
@@ -374,7 +374,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 //Determine Inventory Pickup Button position and draw
                 var buttonPos = Settings.UseCustomMoveToStashButtonPosition
                     ? Settings.CustomMoveToStashButtonPosition
-                    : inventoryRect.TopLeft.ToVector2Num() + new Vector2(buttonSize / 2, -buttonSize - 20);
+                    : inventoryRect.TopLeft.ToVector2Num() + new Vector2(buttonSize / 2, -buttonSize - 40);
                 var buttonRect = new SharpDX.RectangleF(buttonPos.X, buttonPos.Y, buttonSize, buttonSize);
 
                 if (isCustomFilter)
@@ -415,7 +415,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             if (Settings.SortButtonEnable)
             {
                 // Sort button: to the right of the move-to-stash button
-                var sortButtonPos = inventoryRect.TopLeft.ToVector2Num() + new Vector2(buttonSize / 2 + buttonSize + 4, -buttonSize - 20);
+                var sortButtonPos = inventoryRect.TopLeft.ToVector2Num() + new Vector2(buttonSize / 2 + buttonSize + 4, -buttonSize - 40);
                 var sortButtonRect = new SharpDX.RectangleF(sortButtonPos.X, sortButtonPos.Y, buttonSize, buttonSize);
 
                 Graphics.DrawImage("sort.png", sortButtonRect);

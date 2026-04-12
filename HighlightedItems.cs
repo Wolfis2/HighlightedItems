@@ -769,6 +769,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
     // regardless of network latency.
     private static readonly TimeSpan CursorPollDelay = TimeSpan.FromMilliseconds(10);
     private static readonly TimeSpan CursorReleaseTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan CursorPickupTimeout = TimeSpan.FromSeconds(5);
 
     private async SyncTask<bool> WaitForCursorFree()
     {
@@ -778,6 +779,26 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             if (sw.Elapsed > CursorReleaseTimeout)
             {
                 Log($"WaitForCursorFree: timeout after {sw.Elapsed.TotalSeconds:F1}s — cursor still in HoldItem state");
+                return false;
+            }
+            await Wait(CursorPollDelay, false);
+        }
+        return true;
+    }
+
+    // Polls cursor state after a pickup click and waits until the cursor enters the
+    // HoldItem state.  On high-ping connections the server round-trip takes long enough
+    // that the cursor is still in the Free state when the next click fires; without this
+    // wait the placement click lands while the cursor is free, so PoE treats it as a
+    // second pickup rather than a placement, losing the move entirely.
+    private async SyncTask<bool> WaitForCursorHoldItem()
+    {
+        var sw = Stopwatch.StartNew();
+        while (InGameState.IngameUi.Cursor.Action != MouseActionType.HoldItem)
+        {
+            if (sw.Elapsed > CursorPickupTimeout)
+            {
+                Log($"WaitForCursorHoldItem: timeout after {sw.Elapsed.TotalSeconds:F1}s — cursor never entered HoldItem state");
                 return false;
             }
             await Wait(CursorPollDelay, false);
@@ -1258,6 +1279,12 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             await Wait(MouseDownDelay, true);
             Mouse.LeftUp();
             await Wait(KeyDelay, true);
+            if (!await WaitForCursorHoldItem())
+            {
+                Log("SortInventory: pickup timed out — stopping");
+                await StopMovingItems();
+                return false;
+            }
 
             // Place (left-click on destination).
             Mouse.moveMouse(dstCenter + WindowOffset);
@@ -1829,6 +1856,12 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 await Wait(MouseMoveDelay, true);
                 Mouse.LeftDown(); await Wait(MouseDownDelay, true); Mouse.LeftUp();
                 await Wait(KeyDelay, true);
+                if (!await WaitForCursorHoldItem())
+                {
+                    Log("SortStash: inv→stash pickup timed out — stopping");
+                    await StopMovingItems();
+                    return false;
+                }
                 Mouse.moveMouse(dstCenter + WindowOffset);
                 await Wait(MouseMoveDelay, true);
                 Mouse.LeftDown(); await Wait(MouseDownDelay, true); Mouse.LeftUp();
@@ -1877,6 +1910,12 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 await Wait(MouseMoveDelay, true);
                 Mouse.LeftDown(); await Wait(MouseDownDelay, true); Mouse.LeftUp();
                 await Wait(KeyDelay, true);
+                if (!await WaitForCursorHoldItem())
+                {
+                    Log("SortStash: stash→stash pickup timed out — stopping");
+                    await StopMovingItems();
+                    return false;
+                }
                 Mouse.moveMouse(dstCenter + WindowOffset);
                 await Wait(MouseMoveDelay, true);
                 Mouse.LeftDown(); await Wait(MouseDownDelay, true); Mouse.LeftUp();

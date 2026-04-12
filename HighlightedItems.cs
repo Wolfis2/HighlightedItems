@@ -761,6 +761,30 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         return true;
     }
 
+    // Polls cursor state after a placement click and waits until the cursor is no longer
+    // holding an item.  On high-ping connections the server round-trip takes long enough
+    // that the cursor can still be in the HoldItem state when the next loop iteration
+    // reads inventory data, causing the sort to misidentify the item as "still on cursor"
+    // and leaving it there when sorting completes.  Waiting here makes sorting consistent
+    // regardless of network latency.
+    private static readonly TimeSpan CursorPollDelay = TimeSpan.FromMilliseconds(10);
+    private static readonly TimeSpan CursorReleaseTimeout = TimeSpan.FromSeconds(5);
+
+    private async SyncTask<bool> WaitForCursorFree()
+    {
+        var sw = Stopwatch.StartNew();
+        while (InGameState.IngameUi.Cursor.Action == MouseActionType.HoldItem)
+        {
+            if (sw.Elapsed > CursorReleaseTimeout)
+            {
+                Log($"WaitForCursorFree: timeout after {sw.Elapsed.TotalSeconds:F1}s — cursor still in HoldItem state");
+                return false;
+            }
+            await Wait(CursorPollDelay, false);
+        }
+        return true;
+    }
+
     private readonly ConcurrentDictionary<RectangleF, bool?> _mouseStateForRect = [];
 
     private bool IsButtonPressed(RectangleF buttonRect)
@@ -1028,11 +1052,14 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             // prevents vacuous-true exits when parked items have stale plan keys.
             // pendingOldAddress is always 0 here because the stale-data guard above would have
             // continued the loop without reaching this point if it were non-zero.
-            var done = plan.All(kv => rawInventoryItems.Any(x =>
-                x.Item != null
-                && x.Item.Address == kv.Key
-                && x.PosX == kv.Value.col
-                && x.PosY == kv.Value.row));
+            // Also require the cursor is not holding an item — on high-ping connections the cursor
+            // can still be in the HoldItem state while the server has not yet confirmed the drop.
+            var done = InGameState.IngameUi.Cursor.Action != MouseActionType.HoldItem
+                && plan.All(kv => rawInventoryItems.Any(x =>
+                    x.Item != null
+                    && x.Item.Address == kv.Key
+                    && x.PosX == kv.Value.col
+                    && x.PosY == kv.Value.row));
             if (done)
             {
                 Log($"SortInventory: all items at target — done in {moveCount} moves");
@@ -1088,6 +1115,12 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                     await Wait(MouseDownDelay, true);
                     Mouse.LeftUp();
                     await Wait(KeyDelay, true);
+                    if (!await WaitForCursorFree())
+                    {
+                        Log("SortInventory: cursor-held placement timed out — stopping");
+                        await StopMovingItems();
+                        return false;
+                    }
                     pendingOldAddress = heldItem.Item.Address;
                     pendingDestCol = hCol;
                     pendingDestRow = hRow;
@@ -1233,6 +1266,12 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             await Wait(MouseDownDelay, true);
             Mouse.LeftUp();
             await Wait(KeyDelay, true);
+            if (!await WaitForCursorFree())
+            {
+                Log("SortInventory: placement timed out — stopping");
+                await StopMovingItems();
+                return false;
+            }
 
             // Record the old address and destination so the plan key can be re-keyed
             // at the start of the next iteration once the server reflects the placement.
@@ -1731,7 +1770,11 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             pendingRetryCount = 0;
 
             // ── Convergence check ─────────────────────────────────────────────────────
-            if (stagingSet.Count == 0 && plan.All(kv =>
+            // Also require the cursor is not holding an item — on high-ping connections the
+            // cursor can still be in the HoldItem state while the server has not yet confirmed
+            // the drop, which would cause sorting to finish with an item left on the cursor.
+            if (InGameState.IngameUi.Cursor.Action != MouseActionType.HoldItem
+                && stagingSet.Count == 0 && plan.All(kv =>
             {
                 var item = currentStashItems.FirstOrDefault(x => x.Item?.Address == kv.Key);
                 if (item == null) return false;
@@ -1790,6 +1833,12 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 await Wait(MouseMoveDelay, true);
                 Mouse.LeftDown(); await Wait(MouseDownDelay, true); Mouse.LeftUp();
                 await Wait(KeyDelay, true);
+                if (!await WaitForCursorFree())
+                {
+                    Log("SortStash: inv→stash placement timed out — stopping");
+                    await StopMovingItems();
+                    return false;
+                }
 
                 pendingOldAddress = addr;
                 pendingDestCol = target.col;
@@ -1832,6 +1881,12 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 await Wait(MouseMoveDelay, true);
                 Mouse.LeftDown(); await Wait(MouseDownDelay, true); Mouse.LeftUp();
                 await Wait(KeyDelay, true);
+                if (!await WaitForCursorFree())
+                {
+                    Log("SortStash: stash→stash placement timed out — stopping");
+                    await StopMovingItems();
+                    return false;
+                }
 
                 pendingOldAddress = it.Item.Address;
                 pendingDestCol = target.col;
